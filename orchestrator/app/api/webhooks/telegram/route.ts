@@ -39,6 +39,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { TelegramAdapter, type TelegramUpdate } from "@/lib/adapters/TelegramAdapter";
 import type { StandardMessage } from "@/types/messaging";
 import { processUserMessage } from "@/lib/ai/orchestrator";
+import { buildPushCompletionUrl } from "@/lib/pushCallback";
 import { getPendingPatch, getPendingPush, getPendingPushOnly } from "@/lib/redis";
 
 // ---------------------------------------------------------------------------
@@ -317,21 +318,35 @@ async function handlePushAction(message: StandardMessage): Promise<boolean> {
         return true;
     }
 
+    const completionUrl = buildPushCompletionUrl(message.senderId, "commit-and-push");
+
     try {
+        const body: { workspace_path: string; commit_message: string; completion_webhook_url?: string } = {
+            workspace_path: staged.workspace_path,
+            commit_message: staged.commit_message,
+        };
+        if (completionUrl) body.completion_webhook_url = completionUrl;
+
         const res = await fetch(`${daemonUrl}/git/commit-and-push`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                workspace_path: staged.workspace_path,
-                commit_message: staged.commit_message,
-            }),
+            body: JSON.stringify(body),
         });
         const data = (await res.json().catch(() => ({}))) as {
             success?: boolean;
             message?: string;
             stdout?: string;
             stderr?: string;
+            started?: boolean;
         };
+
+        if (res.status === 202 && data.started) {
+            await adapter.sendResponse(
+                { text: "Push started in the background. You'll get a message when it completes." },
+                message.senderId
+            );
+            return true;
+        }
 
         if (data.success) {
             await adapter.sendResponse(
@@ -389,20 +404,34 @@ async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> 
         return true;
     }
 
+    const completionUrl = buildPushCompletionUrl(message.senderId, "push-only");
+
     try {
+        const body: { workspace_path: string; completion_webhook_url?: string } = {
+            workspace_path: staged.workspace_path,
+        };
+        if (completionUrl) body.completion_webhook_url = completionUrl;
+
         const res = await fetch(`${daemonUrl}/git/push-only`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                workspace_path: staged.workspace_path,
-            }),
+            body: JSON.stringify(body),
         });
         const data = (await res.json().catch(() => ({}))) as {
             success?: boolean;
             message?: string;
             stdout?: string;
             stderr?: string;
+            started?: boolean;
         };
+
+        if (res.status === 202 && data.started) {
+            await adapter.sendResponse(
+                { text: "Push started in the background. You'll get a message when it completes." },
+                message.senderId
+            );
+            return true;
+        }
 
         if (data.success) {
             await adapter.sendResponse(

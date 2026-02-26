@@ -308,6 +308,10 @@ class CommitAndPushRequest(BaseModel):
         default="Update from Eureka",
         description="Commit message for the commit.",
     )
+    completion_webhook_url: Optional[str] = Field(
+        default=None,
+        description="If set, commit runs synchronously but push runs in background; response is 202 and completion is POSTed here.",
+    )
 
     @field_validator("workspace_path")
     @classmethod
@@ -324,6 +328,7 @@ class CommitAndPushResponse(BaseModel):
     message: str
     stdout: str = ""
     stderr: str = ""
+    started: bool = False  # True when push is running in background (202 response)
 
 
 class CommitAllRequest(BaseModel):
@@ -356,6 +361,10 @@ class PushRequest(BaseModel):
     """Request body for /git/push-only (push existing commits)."""
 
     workspace_path: str = Field(..., min_length=1, description="Git repo root within ALLOWED_WORKSPACES.")
+    completion_webhook_url: Optional[str] = Field(
+        default=None,
+        description="If set, push runs in background; response is 202 and completion is POSTed here.",
+    )
 
     @field_validator("workspace_path")
     @classmethod
@@ -372,6 +381,7 @@ class PushResponse(BaseModel):
     message: str
     stdout: str = ""
     stderr: str = ""
+    started: bool = False  # True when push is running in background (202 response)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +837,7 @@ def _git_commit_all_sync(workspace_path: str, commit_message: str) -> tuple[bool
         return False, str(e), "", ""
 
 
-def _git_push_only_sync(workspace_path: str) -> tuple[bool, str, str, str]:
+def _git_push_only_sync(workspace_path: str, push_timeout: int = 60) -> tuple[bool, str, str, str]:
     """Run git push only (no add/commit). Returns (success, message, stdout, stderr)."""
     allowed, resolved = _is_path_within_allowed_workspaces(workspace_path)
     if not allowed:
@@ -840,7 +850,7 @@ def _git_push_only_sync(workspace_path: str) -> tuple[bool, str, str, str]:
             cwd=resolved,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=push_timeout,
         )
         if push_result.returncode != 0:
             return False, "git push failed.", push_result.stdout or "", push_result.stderr or ""
@@ -849,6 +859,30 @@ def _git_push_only_sync(workspace_path: str) -> tuple[bool, str, str, str]:
         return False, "Git command timed out.", "", ""
     except Exception as e:
         return False, str(e), "", ""
+
+
+# Background push timeout (no request blocking, so we can allow long pushes)
+_BACKGROUND_PUSH_TIMEOUT = 600
+
+
+def _run_push_and_notify_sync(workspace_path: str, completion_webhook_url: str) -> None:
+    """Run git push (long timeout) then POST result to completion_webhook_url. Runs in thread."""
+    ok, msg, stdout, stderr = _git_push_only_sync(workspace_path, push_timeout=_BACKGROUND_PUSH_TIMEOUT)
+    payload: Dict[str, Any] = {
+        "success": ok,
+        "message": msg,
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+    }
+    try:
+        requests.post(
+            completion_webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+    except Exception as e:
+        logger.warning("Failed to call completion webhook %s: %s", completion_webhook_url, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1261,8 +1295,32 @@ async def git_find_repos() -> ListGitReposResponse:
     tags=["Git"],
     summary="Commit all changes and push",
 )
-async def git_commit_and_push(request: CommitAndPushRequest) -> CommitAndPushResponse:
-    """Run git add -A, git commit -m <message>, git push in the given repo."""
+async def git_commit_and_push(request: CommitAndPushRequest):
+    """Run git add -A, git commit -m <message>, git push in the given repo. If completion_webhook_url is set, push runs in background and result is POSTed there (202)."""
+    if request.completion_webhook_url:
+        # Run add+commit synchronously; push in background and notify via webhook.
+        ok, msg, stdout, stderr = await asyncio.to_thread(
+            _git_commit_all_sync,
+            request.workspace_path,
+            request.commit_message,
+        )
+        if not ok:
+            return CommitAndPushResponse(success=False, message=msg, stdout=stdout, stderr=stderr)
+        asyncio.create_task(
+            asyncio.to_thread(
+                _run_push_and_notify_sync,
+                request.workspace_path,
+                request.completion_webhook_url,
+            )
+        )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=CommitAndPushResponse(
+                success=True,
+                message="Commit done. Push started in background; you will be notified when it completes.",
+                started=True,
+            ).model_dump(),
+        )
     ok, msg, stdout, stderr = await asyncio.to_thread(
         _git_commit_and_push_sync,
         request.workspace_path,
@@ -1293,8 +1351,24 @@ async def git_commit_all(request: CommitAllRequest) -> CommitAllResponse:
     tags=["Git"],
     summary="Push current branch without committing",
 )
-async def git_push_only(request: PushRequest) -> PushResponse:
-    """Run git push in the given repo without staging or committing."""
+async def git_push_only(request: PushRequest):
+    """Run git push in the given repo without staging or committing. If completion_webhook_url is set, push runs in background and result is POSTed there (202)."""
+    if request.completion_webhook_url:
+        asyncio.create_task(
+            asyncio.to_thread(
+                _run_push_and_notify_sync,
+                request.workspace_path,
+                request.completion_webhook_url,
+            )
+        )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=PushResponse(
+                success=True,
+                message="Push started in background; you will be notified when it completes.",
+                started=True,
+            ).model_dump(),
+        )
     ok, msg, stdout, stderr = await asyncio.to_thread(
         _git_push_only_sync,
         request.workspace_path,
