@@ -1,3 +1,4 @@
+#testing
 """
 config.py — Daemon Configuration
 =================================
@@ -42,7 +43,6 @@ class DaemonSettings(BaseSettings):
     For example:
         ALLOWED_WORKSPACES='["/home/user/project", "/home/user/libs"]'
     """
-
     model_config = SettingsConfigDict(
         # Load a .env file from the project root (same directory as this file).
         env_file=".env",
