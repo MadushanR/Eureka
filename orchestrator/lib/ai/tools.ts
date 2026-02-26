@@ -562,6 +562,167 @@ export const requestPatchApproval = tool({
 });
 
 /**
+ * Tool: remove_line
+ * -----------------
+ * Ask the daemon to compute a patch that removes a specific line (or range) from a file.
+ * Then stages the patch for user approval (Approve & Apply). Use when the user says
+ * e.g. "Remove line 10 from Eureka/src/main.py".
+ */
+export const removeLine = tool({
+    description:
+        "Remove a specific line (or range of lines) from a file in a repo. " +
+        "Use when the user asks to remove line N, or lines N–M, from a file (e.g. 'Remove line 10 from Eureka/src/main.py'). " +
+        "Call list_git_repos first to get workspace_path, then call this with the repo path and file path relative to the repo.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .min(1, "workspace_path must not be empty.")
+            .describe("Absolute path to the git repository root."),
+        file_path: z
+            .string()
+            .min(1, "file_path must not be empty.")
+            .describe("Path to the file relative to the repo root (e.g. src/main.py)."),
+        line_number: z.number().int().min(1).describe("1-based line number to remove."),
+        line_end: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Optional 1-based end line for a range (inclusive)."),
+    }),
+    async execute({
+        workspace_path,
+        file_path,
+        line_number,
+        line_end,
+    }: {
+        workspace_path: string;
+        file_path: string;
+        line_number: number;
+        line_end?: number;
+    }): Promise<StandardResponse | { success: boolean; error: string }> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        const url = `${base}/edit/compute-remove-line-patch`;
+        let data: { success?: boolean; message?: string; patch?: string };
+        try {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path,
+                    file_path,
+                    line_number,
+                    ...(line_end != null ? { line_end } : {}),
+                }),
+            });
+            data = (await res.json().catch(() => ({}))) as typeof data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+        }
+        if (!data.success) {
+            return { success: false, error: data.message ?? "Could not compute patch." };
+        }
+        const patch = (data.patch ?? "").trim();
+        if (!patch) {
+            return { text: "No patch was produced (check line number is in range)." };
+        }
+        const patchId = await stagePatch(patch, workspace_path);
+        return {
+            text: `I have prepared a patch to remove line ${line_number}${line_end != null ? `–${line_end}` : ""} from \`${file_path}\`. Do you want to apply it?`,
+            interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+        };
+    },
+});
+
+/**
+ * Tool: remove_lines_matching
+ * ---------------------------
+ * Ask the daemon to compute a patch that removes all lines containing a pattern
+ * (in one file or all files in the repo). Then stages the patch for approval.
+ * Use for e.g. "Remove all lines that say '#testing'" in one file or all files.
+ */
+export const removeLinesMatching = tool({
+    description:
+        "Remove all lines that contain a given pattern (literal text) from a file or from all files in a repo. " +
+        "Use when the user asks to remove lines containing some text (e.g. 'Remove #testing from Eureka', 'Remove all lines that say #testing from all files in Eureka'). " +
+        "For a single file, pass file_path. For all files, omit file_path. Call list_git_repos first to get workspace_path.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .min(1, "workspace_path must not be empty.")
+            .describe("Absolute path to the git repository root."),
+        pattern: z
+            .string()
+            .min(1, "pattern must not be empty.")
+            .describe("Literal substring to find; every line containing this will be removed."),
+        file_path: z
+            .string()
+            .optional()
+            .describe(
+                "If set, only this file (relative to repo). If omitted, all files in the repo are scanned.",
+            ),
+        path_glob: z
+            .string()
+            .optional()
+            .describe("When scanning multiple files, restrict to paths matching this glob (e.g. **/*.py). Default: **/*"),
+    }),
+    async execute({
+        workspace_path,
+        pattern,
+        file_path,
+        path_glob,
+    }: {
+        workspace_path: string;
+        pattern: string;
+        file_path?: string;
+        path_glob?: string;
+    }): Promise<StandardResponse | { success: boolean; error: string }> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        const url = `${base}/edit/compute-remove-lines-matching-patch`;
+        let data: { success?: boolean; message?: string; patch?: string; files_affected?: number };
+        try {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path,
+                    pattern,
+                    ...(file_path != null && file_path !== "" ? { file_path } : {}),
+                    ...(path_glob != null && path_glob !== "" ? { path_glob } : {}),
+                }),
+            });
+            data = (await res.json().catch(() => ({}))) as typeof data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+        }
+        if (!data.success) {
+            return { success: false, error: data.message ?? "Could not compute patch." };
+        }
+        const patch = (data.patch ?? "").trim();
+        const filesAffected = data.files_affected ?? 0;
+        if (!patch) {
+            return {
+                text: filesAffected === 0
+                    ? `No lines containing "${pattern}" were found${file_path ? ` in ${file_path}` : " in any file"}.`
+                    : "No patch was produced.",
+            };
+        }
+        const patchId = await stagePatch(patch, workspace_path);
+        const scope = file_path ? ` in \`${file_path}\`` : ` across ${filesAffected} file(s)`;
+        return {
+            text: `I have prepared a patch to remove all lines containing "${pattern}"${scope}. Do you want to apply it?`,
+            interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+        };
+    },
+});
+
+/**
  * Tool: prepare_push_approval
  * ---------------------------
  * Two-step flow: (1) Show uncommitted diff and ask for a commit message.
@@ -895,6 +1056,8 @@ export const systemLock = tool({
 export const aiTools = {
     search_local_codebase: searchLocalCodebase,
     request_patch_approval: requestPatchApproval,
+    remove_line: removeLine,
+    remove_lines_matching: removeLinesMatching,
     prepare_push_approval: preparePushApproval,
     prepare_push_only_approval: preparePushOnlyApproval,
     list_git_repos: listGitRepos,

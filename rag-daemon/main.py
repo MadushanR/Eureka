@@ -36,6 +36,8 @@ or, during development with auto-reload:
 from __future__ import annotations
 
 import asyncio
+import difflib
+import fnmatch
 import logging
 import os
 import platform
@@ -206,6 +208,51 @@ class ApplyPatchResponse(BaseModel):
     message: str
     stdout: str = ""
     stderr: str = ""
+
+
+class ComputeRemoveLinePatchRequest(BaseModel):
+    """Request body for /edit/compute-remove-line-patch."""
+
+    workspace_path: str = Field(..., min_length=1)
+    file_path: str = Field(..., min_length=1, description="Path relative to workspace_path.")
+    line_number: int = Field(..., ge=1, description="1-based line number to remove.")
+    line_end: Optional[int] = Field(default=None, ge=1, description="Optional 1-based end line for range (inclusive).")
+
+    @field_validator("workspace_path", "file_path")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Must not be blank.")
+        return v
+
+
+class ComputeRemoveLinePatchResponse(BaseModel):
+    success: bool
+    message: str = ""
+    patch: str = ""
+
+
+class ComputeRemoveLinesMatchingPatchRequest(BaseModel):
+    """Request body for /edit/compute-remove-lines-matching-patch."""
+
+    workspace_path: str = Field(..., min_length=1)
+    pattern: str = Field(..., description="Literal substring to find in lines; matching lines are removed.")
+    file_path: Optional[str] = Field(default=None, description="If set, only this file (relative to workspace); else all files.")
+    path_glob: Optional[str] = Field(default="**/*", description="Glob for relative paths when scanning multiple files (e.g. **/*.py).")
+
+    @field_validator("workspace_path")
+    @classmethod
+    def _wp_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("workspace_path must not be blank.")
+        return v
+
+
+class ComputeRemoveLinesMatchingPatchResponse(BaseModel):
+    success: bool
+    message: str = ""
+    patch: str = ""
+    files_affected: int = 0
 
 
 class IndexNowResponse(BaseModel):
@@ -886,6 +933,156 @@ def _run_push_and_notify_sync(workspace_path: str, completion_webhook_url: str) 
 
 
 # ---------------------------------------------------------------------------
+# Edit helpers (compute patch only; no disk write)
+# ---------------------------------------------------------------------------
+
+def _edit_should_ignore(rel_path: Path) -> bool:
+    """True if any component of rel_path matches settings.ignore_patterns."""
+    for part in rel_path.parts:
+        for pattern in settings.ignore_patterns:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+    return False
+
+
+def _edit_read_text(path: Path) -> Optional[str]:
+    """Read file as text; return None if binary or unreadable."""
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except (UnicodeDecodeError, OSError):
+            continue
+    return None
+
+
+def _build_unified_diff(rel_path_str: str, old_lines: List[str], new_lines: List[str]) -> str:
+    """Build a git-style unified diff for one file. rel_path_str uses forward slashes.
+    Input lines may have trailing newlines; we strip them for difflib (which expects no newlines).
+    """
+    fromfile = "a/" + rel_path_str.replace("\\", "/")
+    tofile = "b/" + rel_path_str.replace("\\", "/")
+    a = [ln.rstrip("\n") for ln in old_lines]
+    b = [ln.rstrip("\n") for ln in new_lines]
+    diff_lines = list(
+        difflib.unified_diff(
+            a,
+            b,
+            fromfile=fromfile,
+            tofile=tofile,
+            fromfiledate="",
+            tofiledate="",
+            lineterm="\n",
+        )
+    )
+    if not diff_lines:
+        return ""
+    return "".join(diff_lines)
+
+
+def _compute_remove_line_patch_sync(
+    workspace_path: str,
+    file_path: str,
+    line_number: int,
+    line_end: Optional[int],
+) -> tuple[bool, str, str]:
+    """Compute a patch that removes the given line(s). Returns (success, message, patch)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(workspace_path)
+    if not allowed:
+        return False, "Workspace path is not in ALLOWED_WORKSPACES.", ""
+    # Resolve file_path relative to workspace (no .. escape).
+    try:
+        full_path = (resolved_workspace / file_path.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return False, "file_path is outside the workspace.", ""
+    if not full_path.is_file():
+        return False, f"Not a file or does not exist: {full_path}", ""
+    content = _edit_read_text(full_path)
+    if content is None:
+        return False, "Could not read file as text.", ""
+    lines = content.splitlines(keepends=True)
+    if not lines and not content.endswith("\n"):
+        lines = [content] if content else []
+    elif content and not content.endswith("\n") and lines:
+        lines[-1] = lines[-1] + "\n"
+    n = len(lines)
+    start = line_number - 1
+    end = (line_end if line_end is not None else line_number) - 1
+    if start < 0 or end < start or end >= n:
+        return False, f"Line number(s) out of range (file has {n} lines).", ""
+    new_lines = lines[:start] + lines[end + 1 :]
+    rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
+    patch = _build_unified_diff(rel_path_str, lines, new_lines)
+    return True, "", patch
+
+
+def _compute_remove_lines_matching_patch_sync(
+    workspace_path: str,
+    pattern: str,
+    file_path: Optional[str],
+    path_glob: str,
+) -> tuple[bool, str, str, int]:
+    """Compute a patch that removes all lines containing pattern. Returns (success, message, patch, files_affected)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(workspace_path)
+    if not allowed:
+        return False, "Workspace path is not in ALLOWED_WORKSPACES.", "", 0
+    patches: List[str] = []
+    files_affected = 0
+
+    if file_path:
+        full_path = (resolved_workspace / file_path.replace("\\", "/").strip("/")).resolve()
+        try:
+            full_path.relative_to(resolved_workspace)
+        except ValueError:
+            return False, "file_path is outside the workspace.", "", 0
+        if not full_path.is_file():
+            return False, f"Not a file or does not exist: {full_path}", "", 0
+        content = _edit_read_text(full_path)
+        if content is None:
+            return False, "Could not read file as text.", "", 0
+        lines = content.splitlines(keepends=True)
+        if not lines and not content.endswith("\n"):
+            lines = [content] if content else []
+        elif content and not content.endswith("\n") and lines:
+            lines[-1] = lines[-1] + "\n"
+        new_lines = [line for line in lines if pattern not in line]
+        if len(new_lines) == len(lines):
+            return True, "", "", 0
+        rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
+        patch = _build_unified_diff(rel_path_str, lines, new_lines)
+        return True, "", patch, 1
+
+    for path in resolved_workspace.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(resolved_workspace)
+        except ValueError:
+            continue
+        if _edit_should_ignore(rel):
+            continue
+        if not fnmatch.fnmatch(str(rel).replace("\\", "/"), path_glob):
+            continue
+        content = _edit_read_text(path)
+        if content is None:
+            continue
+        lines = content.splitlines(keepends=True)
+        if not lines and not content.endswith("\n"):
+            lines = [content] if content else []
+        elif content and not content.endswith("\n") and lines:
+            lines[-1] = lines[-1] + "\n"
+        new_lines = [line for line in lines if pattern not in line]
+        if len(new_lines) == len(lines):
+            continue
+        rel_path_str = str(rel).replace("\\", "/")
+        patch = _build_unified_diff(rel_path_str, lines, new_lines)
+        patches.append(patch)
+        files_affected += 1
+
+    return True, "", "\n".join(patches), files_affected
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -1374,6 +1571,49 @@ async def git_push_only(request: PushRequest):
         request.workspace_path,
     )
     return PushResponse(success=ok, message=msg, stdout=stdout, stderr=stderr)
+
+
+@app.post(
+    "/edit/compute-remove-line-patch",
+    response_model=ComputeRemoveLinePatchResponse,
+    tags=["Edit"],
+    summary="Compute a patch that removes a line (or range) from a file",
+)
+async def compute_remove_line_patch(request: ComputeRemoveLinePatchRequest) -> ComputeRemoveLinePatchResponse:
+    """Compute a unified diff that removes the given line(s). Does not apply the patch."""
+    success, message, patch = await asyncio.to_thread(
+        _compute_remove_line_patch_sync,
+        request.workspace_path,
+        request.file_path,
+        request.line_number,
+        request.line_end,
+    )
+    return ComputeRemoveLinePatchResponse(success=success, message=message, patch=patch)
+
+
+@app.post(
+    "/edit/compute-remove-lines-matching-patch",
+    response_model=ComputeRemoveLinesMatchingPatchResponse,
+    tags=["Edit"],
+    summary="Compute a patch that removes all lines containing a pattern",
+)
+async def compute_remove_lines_matching_patch(
+    request: ComputeRemoveLinesMatchingPatchRequest,
+) -> ComputeRemoveLinesMatchingPatchResponse:
+    """Compute a unified diff that removes every line containing pattern (in one file or all). Does not apply."""
+    success, message, patch, files_affected = await asyncio.to_thread(
+        _compute_remove_lines_matching_patch_sync,
+        request.workspace_path,
+        request.pattern,
+        request.file_path,
+        request.path_glob or "**/*",
+    )
+    return ComputeRemoveLinesMatchingPatchResponse(
+        success=success,
+        message=message,
+        patch=patch,
+        files_affected=files_affected,
+    )
 
 
 @app.post(
