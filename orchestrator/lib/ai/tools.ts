@@ -16,6 +16,22 @@ import { stagePatch, stagePush, stagePushOnly } from "@/lib/redis";
 
 const LOCAL_DAEMON_BASE = () => process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
 
+/** Resolve a repo name (e.g. "Eureka") to an absolute workspace path via the daemon. Returns null if not found or daemon unavailable. */
+async function resolveRepoName(repoName: string): Promise<string | null> {
+    const base = LOCAL_DAEMON_BASE();
+    if (!base) return null;
+    try {
+        const res = await fetch(`${base}/git/find-repos`, { method: "GET" });
+        const data = (await res.json().catch(() => ({}))) as { repos?: Array<{ name: string; path: string }> };
+        const repos = data.repos ?? [];
+        const name = repoName.trim().toLowerCase();
+        const match = repos.find((r) => r.name.toLowerCase() === name);
+        return match ? match.path : null;
+    } catch {
+        return null;
+    }
+}
+
 async function spotifyDaemonCall(
     method: "GET" | "POST",
     path: string,
@@ -223,9 +239,8 @@ export const listWorkspaceFolders = tool({
  */
 export const listGitRepos = tool({
     description:
-        "Find git repositories under the allowed workspaces on the local machine. " +
-        "Use this to resolve project names like 'Eureka' to absolute repo paths. " +
-        "When the user asked to edit or remove something in a repo, you MUST call this first and then immediately call remove_line, remove_lines_matching, get_uncommitted_changes, or prepare_push_approval with the path from the result — do not reply to the user with only this repo list.",
+        "Find git repositories under the allowed workspaces. Returns a list of repo names and paths. " +
+        "For uncommitted changes, removing lines, or removing lines matching text, prefer calling get_uncommitted_changes, remove_line, or remove_lines_matching with repo_name (e.g. 'Eureka') — they resolve the repo automatically. Use this tool when you need to list or discover repos, or when prepare_push_approval needs a path.",
     // No input parameters — just scan all allowed workspaces.
     inputSchema: z
         .object({})
@@ -300,31 +315,40 @@ export const listGitRepos = tool({
  * Tool: get_uncommitted_changes
  * -----------------------------
  * Get uncommitted changes (diff + status) for one repo or for all repos.
- * Use when the user asks "any uncommitted changes?", "uncommitted changes in Eureka",
- * "show me changes in all repos", etc. For a named repo, call list_git_repos first to
- * resolve the path, then call this with that workspace_path.
+ * Accepts either workspace_path (absolute) or repo_name (e.g. "Eureka"); resolves repo_name automatically.
  */
 export const getUncommittedChanges = tool({
     description:
         "Get uncommitted changes (diff and status) for a git repo or for all repos. " +
-        "Use when the user asks about uncommitted changes, e.g. 'any uncommitted changes?', 'uncommitted changes in Eureka', 'show changes in all repos'. " +
-        "If workspace_path is provided, returns changes for that repo only. If omitted, returns a summary for every git repo under the allowed workspaces.",
+        "Use when the user asks about uncommitted changes (e.g. 'any uncommitted changes in Eureka', 'show changes in all repos'). " +
+        "Pass repo_name (e.g. 'Eureka') to target one repo, or workspace_path. Pass neither to get a summary for all repos.",
     inputSchema: z.object({
         workspace_path: z
             .string()
             .optional()
-            .describe(
-                "Absolute path to one repo. Omit to get uncommitted changes for all repos.",
-            ),
+            .describe("Absolute path to one repo. Use repo_name instead if the user said a name like 'Eureka'."),
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Repo name the user said (e.g. 'Eureka'). The tool will resolve it to a path. Use this when the user names a repo."),
     }),
     async execute({
         workspace_path,
+        repo_name,
     }: {
         workspace_path?: string;
+        repo_name?: string;
     }): Promise<{ text: string } | { error: string }> {
         const base = LOCAL_DAEMON_BASE();
         if (!base) {
             return { error: "LOCAL_DAEMON_URL is not configured." };
+        }
+
+        let resolvedPath = workspace_path?.trim();
+        if (repo_name?.trim() && !resolvedPath) {
+            const path = await resolveRepoName(repo_name);
+            if (!path) return { error: `Repository "${repo_name}" not found.` };
+            resolvedPath = path;
         }
 
         const maxDiffLen = 3200;
@@ -344,14 +368,14 @@ export const getUncommittedChanges = tool({
             return (await res.json().catch(() => ({}))) as DiffData;
         }
 
-        if (workspace_path && workspace_path.trim()) {
-            const data = await fetchDiff(workspace_path.trim());
+        if (resolvedPath) {
+            const data = await fetchDiff(resolvedPath);
             if (!data.success) {
                 return { error: data.message ?? "Could not get repo status." };
             }
             if (!data.has_changes) {
                 return {
-                    text: `**${workspace_path}**\n\nNo uncommitted changes. Working tree clean.`,
+                    text: `**${resolvedPath}**\n\nNo uncommitted changes. Working tree clean.`,
                 };
             }
             const diff = (data.diff ?? "").trim();
@@ -360,7 +384,7 @@ export const getUncommittedChanges = tool({
             const diffText = truncated ? diff.slice(0, maxDiffLen) + "\n\n… (truncated)" : diff;
             return {
                 text:
-                    `**${workspace_path}**\n\n` +
+                    `**${resolvedPath}**\n\n` +
                     (statusShort ? `Status: ${statusShort}\n\n` : "") +
                     "Uncommitted changes:\n\n```\n" +
                     diffText +
@@ -566,23 +590,20 @@ export const requestPatchApproval = tool({
  * Tool: remove_line
  * -----------------
  * Ask the daemon to compute a patch that removes a specific line (or range) from a file.
- * Then stages the patch for user approval (Approve & Apply). Use when the user says
- * e.g. "Remove line 10 from Eureka/src/main.py".
+ * Accepts repo_name (e.g. "Eureka") or workspace_path; resolves repo_name automatically.
  */
 export const removeLine = tool({
     description:
         "Remove a specific line (or range of lines) from a file in a repo. " +
-        "Use when the user asks to remove line N, or lines N–M, from a file (e.g. 'Remove line 10 from Eureka/src/main.py'). " +
-        "Call list_git_repos first to get workspace_path, then call this with the repo path and file path relative to the repo.",
+        "Use when the user asks to remove line N from a file (e.g. 'Remove line 1 from rag-daemon/config.py in Eureka'). " +
+        "Pass repo_name (e.g. 'Eureka') if the user named a repo, or workspace_path. file_path is relative to the repo (e.g. rag-daemon/config.py).",
     inputSchema: z.object({
-        workspace_path: z
-            .string()
-            .min(1, "workspace_path must not be empty.")
-            .describe("Absolute path to the git repository root."),
+        workspace_path: z.string().optional().describe("Absolute path to the git repository root."),
+        repo_name: z.string().optional().describe("Repo name the user said (e.g. 'Eureka'). Use when the user names a repo."),
         file_path: z
             .string()
             .min(1, "file_path must not be empty.")
-            .describe("Path to the file relative to the repo root (e.g. src/main.py)."),
+            .describe("Path to the file relative to the repo root (e.g. rag-daemon/config.py or src/main.py)."),
         line_number: z.number().int().min(1).describe("1-based line number to remove."),
         line_end: z
             .number()
@@ -593,11 +614,13 @@ export const removeLine = tool({
     }),
     async execute({
         workspace_path,
+        repo_name,
         file_path,
         line_number,
         line_end,
     }: {
-        workspace_path: string;
+        workspace_path?: string;
+        repo_name?: string;
         file_path: string;
         line_number: number;
         line_end?: number;
@@ -606,6 +629,15 @@ export const removeLine = tool({
         if (!base) {
             return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         }
+        let resolvedPath = workspace_path?.trim();
+        if (repo_name?.trim() && !resolvedPath) {
+            const path = await resolveRepoName(repo_name);
+            if (!path) return { success: false, error: `Repository "${repo_name}" not found.` };
+            resolvedPath = path;
+        }
+        if (!resolvedPath) {
+            return { success: false, error: "Provide either workspace_path or repo_name." };
+        }
         const url = `${base}/edit/compute-remove-line-patch`;
         let data: { success?: boolean; message?: string; patch?: string };
         try {
@@ -613,8 +645,8 @@ export const removeLine = tool({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    workspace_path,
-                    file_path,
+                    workspace_path: resolvedPath,
+                    file_path: file_path.replace(/\\/g, "/"),
                     line_number,
                     ...(line_end != null ? { line_end } : {}),
                 }),
@@ -630,7 +662,7 @@ export const removeLine = tool({
         if (!patch) {
             return { text: "No patch was produced (check line number is in range)." };
         }
-        const patchId = await stagePatch(patch, workspace_path);
+        const patchId = await stagePatch(patch, resolvedPath);
         return {
             text: `I have prepared a patch to remove line ${line_number}${line_end != null ? `–${line_end}` : ""} from \`${file_path}\`. Do you want to apply it?`,
             interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
@@ -641,20 +673,17 @@ export const removeLine = tool({
 /**
  * Tool: remove_lines_matching
  * ---------------------------
- * Ask the daemon to compute a patch that removes all lines containing a pattern
- * (in one file or all files in the repo). Then stages the patch for approval.
- * Use for e.g. "Remove all lines that say '#testing'" in one file or all files.
+ * Ask the daemon to compute a patch that removes all lines containing a pattern.
+ * Accepts repo_name (e.g. "Eureka") or workspace_path; resolves repo_name automatically.
  */
 export const removeLinesMatching = tool({
     description:
         "Remove all lines that contain a given pattern (literal text) from a file or from all files in a repo. " +
-        "Use when the user asks to remove lines containing some text (e.g. 'Remove #testing from Eureka', 'Remove all lines that say #testing from all files in Eureka'). " +
-        "You MUST call list_git_repos first, then call this with workspace_path set to the path of the repo the user named (e.g. from repos[0].path). For a single file pass file_path; for all files omit file_path.",
+        "Use when the user asks to remove lines containing some text (e.g. 'Remove #testing from Eureka', 'Remove #testing from all files in Eureka'). " +
+        "Pass repo_name (e.g. 'Eureka') if the user named a repo, or workspace_path. For one file pass file_path; for all files omit file_path.",
     inputSchema: z.object({
-        workspace_path: z
-            .string()
-            .min(1, "workspace_path must not be empty.")
-            .describe("Absolute path to the git repository root."),
+        workspace_path: z.string().optional().describe("Absolute path to the git repository root."),
+        repo_name: z.string().optional().describe("Repo name the user said (e.g. 'Eureka'). Use when the user names a repo."),
         pattern: z
             .string()
             .min(1, "pattern must not be empty.")
@@ -672,11 +701,13 @@ export const removeLinesMatching = tool({
     }),
     async execute({
         workspace_path,
+        repo_name,
         pattern,
         file_path,
         path_glob,
     }: {
-        workspace_path: string;
+        workspace_path?: string;
+        repo_name?: string;
         pattern: string;
         file_path?: string;
         path_glob?: string;
@@ -685,6 +716,15 @@ export const removeLinesMatching = tool({
         if (!base) {
             return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         }
+        let resolvedPath = workspace_path?.trim();
+        if (repo_name?.trim() && !resolvedPath) {
+            const path = await resolveRepoName(repo_name);
+            if (!path) return { success: false, error: `Repository "${repo_name}" not found.` };
+            resolvedPath = path;
+        }
+        if (!resolvedPath) {
+            return { success: false, error: "Provide either workspace_path or repo_name." };
+        }
         const url = `${base}/edit/compute-remove-lines-matching-patch`;
         let data: { success?: boolean; message?: string; patch?: string; files_affected?: number };
         try {
@@ -692,9 +732,9 @@ export const removeLinesMatching = tool({
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    workspace_path,
+                    workspace_path: resolvedPath,
                     pattern,
-                    ...(file_path != null && file_path !== "" ? { file_path } : {}),
+                    ...(file_path != null && file_path !== "" ? { file_path: file_path.replace(/\\/g, "/") } : {}),
                     ...(path_glob != null && path_glob !== "" ? { path_glob } : {}),
                 }),
             });
@@ -714,7 +754,7 @@ export const removeLinesMatching = tool({
                     : "No patch was produced.",
             };
         }
-        const patchId = await stagePatch(patch, workspace_path);
+        const patchId = await stagePatch(patch, resolvedPath);
         const scope = file_path ? ` in \`${file_path}\`` : ` across ${filesAffected} file(s)`;
         return {
             text: `I have prepared a patch to remove all lines containing "${pattern}"${scope}. Do you want to apply it?`,
