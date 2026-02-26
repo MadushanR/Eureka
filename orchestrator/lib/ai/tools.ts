@@ -296,6 +296,121 @@ export const listGitRepos = tool({
 });
 
 /**
+ * Tool: get_uncommitted_changes
+ * -----------------------------
+ * Get uncommitted changes (diff + status) for one repo or for all repos.
+ * Use when the user asks "any uncommitted changes?", "uncommitted changes in Eureka",
+ * "show me changes in all repos", etc. For a named repo, call list_git_repos first to
+ * resolve the path, then call this with that workspace_path.
+ */
+export const getUncommittedChanges = tool({
+    description:
+        "Get uncommitted changes (diff and status) for a git repo or for all repos. " +
+        "Use when the user asks about uncommitted changes, e.g. 'any uncommitted changes?', 'uncommitted changes in Eureka', 'show changes in all repos'. " +
+        "If workspace_path is provided, returns changes for that repo only. If omitted, returns a summary for every git repo under the allowed workspaces.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .optional()
+            .describe(
+                "Absolute path to one repo. Omit to get uncommitted changes for all repos.",
+            ),
+    }),
+    async execute({
+        workspace_path,
+    }: {
+        workspace_path?: string;
+    }): Promise<{ text: string } | { error: string }> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { error: "LOCAL_DAEMON_URL is not configured." };
+        }
+
+        const maxDiffLen = 3200;
+        const maxDiffLenAllRepos = 1200;
+
+        type DiffData = {
+            success?: boolean;
+            message?: string;
+            has_changes?: boolean;
+            diff?: string;
+            status_short?: string;
+        };
+
+        async function fetchDiff(path: string): Promise<DiffData> {
+            const url = `${base}/git/uncommitted-diff?${new URLSearchParams({ workspace_path: path }).toString()}`;
+            const res = await fetch(url, { method: "GET" });
+            return (await res.json().catch(() => ({}))) as DiffData;
+        }
+
+        if (workspace_path && workspace_path.trim()) {
+            const data = await fetchDiff(workspace_path.trim());
+            if (!data.success) {
+                return { error: data.message ?? "Could not get repo status." };
+            }
+            if (!data.has_changes) {
+                return {
+                    text: `**${workspace_path}**\n\nNo uncommitted changes. Working tree clean.`,
+                };
+            }
+            const diff = (data.diff ?? "").trim();
+            const statusShort = (data.status_short ?? "").trim();
+            const truncated = diff.length > maxDiffLen;
+            const diffText = truncated ? diff.slice(0, maxDiffLen) + "\n\n… (truncated)" : diff;
+            return {
+                text:
+                    `**${workspace_path}**\n\n` +
+                    (statusShort ? `Status: ${statusShort}\n\n` : "") +
+                    "Uncommitted changes:\n\n```\n" +
+                    diffText +
+                    "\n```",
+            };
+        }
+
+        // All repos: list repos then fetch diff for each.
+        const listUrl = `${base}/git/find-repos`;
+        let repos: Array<{ name: string; path: string }>;
+        try {
+            const listRes = await fetch(listUrl, { method: "GET" });
+            const listData = (await listRes.json().catch(() => ({}))) as { repos?: Array<{ name: string; path: string }> };
+            repos = listData.repos ?? [];
+        } catch {
+            return { error: "Failed to list git repositories." };
+        }
+        if (repos.length === 0) {
+            return { text: "No git repositories found under the allowed workspaces." };
+        }
+
+        const sections: string[] = [];
+        for (const repo of repos) {
+            const data = await fetchDiff(repo.path);
+            if (!data.success) {
+                sections.push(`**${repo.name}** (${repo.path})\n\nError: ${data.message ?? "Could not get status."}\n`);
+                continue;
+            }
+            if (!data.has_changes) {
+                sections.push(`**${repo.name}** (${repo.path})\n\nNo uncommitted changes.\n`);
+                continue;
+            }
+            const diff = (data.diff ?? "").trim();
+            const statusShort = (data.status_short ?? "").trim();
+            const truncated = diff.length > maxDiffLenAllRepos;
+            const diffText = truncated ? diff.slice(0, maxDiffLenAllRepos) + "\n\n… (truncated)" : diff;
+            sections.push(
+                `**${repo.name}** (${repo.path})\n\n` +
+                    (statusShort ? `Status: ${statusShort}\n\n` : "") +
+                    "```\n" +
+                    diffText +
+                    "\n```\n",
+            );
+        }
+        return {
+            text: "Summary for all git repos:\n\n" + sections.join("\n---\n\n"),
+        };
+    },
+});
+
+/**
  * Tool: list_folder_contents
  * --------------------------
  * Ask the local daemon to list the immediate files and folders inside a
@@ -783,6 +898,7 @@ export const aiTools = {
     prepare_push_approval: preparePushApproval,
     prepare_push_only_approval: preparePushOnlyApproval,
     list_git_repos: listGitRepos,
+    get_uncommitted_changes: getUncommittedChanges,
     list_workspace_folders: listWorkspaceFolders,
     list_folder_contents: listFolderContents,
     delete_path: deletePath,

@@ -204,6 +204,7 @@ export async function processUserMessage(
             "For deleting a file or folder, use the delete_path tool with the full absolute path. " +
             "When the user wants to work with a git repo (e.g. 'Eureka'), first call list_git_repos to discover all repos under the allowed workspaces " +
             "and resolve the correct repo path (for example, a repo named 'Eureka' will usually live at C:\\Users\\madus\\Desktop\\Eureka). " +
+            "When the user asks about uncommitted changes (e.g. 'any uncommitted changes?', 'uncommitted changes in Eureka', 'show changes in all repos'), call get_uncommitted_changes(workspace_path) for one repo (use list_git_repos first to get the path) or get_uncommitted_changes() with no argument for all repos. Do NOT reply with only the list of repos when they asked for uncommitted changes — always call get_uncommitted_changes. " +
             "When the user wants to stage and push new changes (e.g. 'push my changes'), first call prepare_push_approval(workspace_path) without a commit message to show the diff and ask for a commit message. " +
             "When they reply with a message (or 'default'), call prepare_push_approval(workspace_path, commit_message) with their reply to show the Approve & Push button. " +
             "When the user wants to push existing commits even if there are no uncommitted changes (e.g. 'push my commits', 'push even if no uncommitted changes'), call prepare_push_only_approval(workspace_path) instead, which will show a push-only approval button.",
@@ -225,47 +226,19 @@ export async function processUserMessage(
             maxSteps: 5,
         });
 
-        // Debug: log result shape when text is empty (remove once "no response" is fixed)
+        // When the model returns empty text we still use tool output; only log a short summary.
         if (typeof result.text !== "string" || result.text.trim().length === 0) {
-            const shape = {
-                hasText: typeof result.text,
-                textLength: typeof result.text === "string" ? result.text.length : 0,
-                toolResultsLength: Array.isArray(result.toolResults) ? result.toolResults.length : "none",
-                stepsLength: Array.isArray((result as { steps?: unknown[] }).steps)
-                    ? (result as { steps: unknown[] }).steps.length
-                    : "none",
-                resultKeys: Object.keys(result),
-            };
-            console.warn(
-                "[orchestrator] generateText returned empty text. Result shape:",
-                JSON.stringify(shape),
-            );
-
-            // Extra debug: log the first tool result and first step in a compact form.
-            try {
-                const firstTool = Array.isArray(result.toolResults)
-                    ? result.toolResults[0]
+            const toolCount = Array.isArray(result.toolResults) ? result.toolResults.length : 0;
+            const stepsCount = Array.isArray((result as { steps?: unknown[] }).steps)
+                ? (result as { steps: unknown[] }).steps.length
+                : 0;
+            const firstToolName =
+                Array.isArray(result.toolResults) && result.toolResults.length > 0
+                    ? (result.toolResults[0] as { toolName?: string }).toolName ?? "?"
                     : null;
-                const stepsDebug = (result as { steps?: unknown[] }).steps;
-                const firstStep =
-                    Array.isArray(stepsDebug) && stepsDebug.length > 0
-                        ? stepsDebug[0]
-                        : null;
-
-                console.warn(
-                    "[orchestrator] first toolResults[0]:",
-                    JSON.stringify(firstTool),
-                );
-                console.warn(
-                    "[orchestrator] first steps[0]:",
-                    JSON.stringify(firstStep),
-                );
-            } catch (debugError) {
-                console.warn(
-                    "[orchestrator] failed to log detailed result debug:",
-                    debugError,
-                );
-            }
+            console.info(
+                `[orchestrator] generateText returned no text; toolResults=${toolCount}, steps=${stepsCount}, firstTool=${firstToolName}`,
+            );
         }
 
         // The primary natural-language reply from the assistant.
