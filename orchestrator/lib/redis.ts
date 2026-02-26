@@ -83,7 +83,7 @@ const chatKey = (senderId: string): string => `chat:${senderId}`;
 const patchKey = (patchId: string): string => `patch:${patchId}`;
 
 /**
- * Build the Redis key used to temporarily store a pending push (commit-only) request.
+ * Build the Redis key used to temporarily store a pending push (commit+push) request.
  */
 const pushKey = (pushId: string): string => `push:${pushId}`;
 
@@ -91,6 +91,11 @@ const pushKey = (pushId: string): string => `push:${pushId}`;
  * Build the Redis key used to temporarily store a pending commit request.
  */
 const commitKey = (commitId: string): string => `commit:${commitId}`;
+
+/**
+ * Build the Redis key used to temporarily store a pending push-only request.
+ */
+const pushOnlyKey = (pushOnlyId: string): string => `pushonly:${pushOnlyId}`;
 
 // ---------------------------------------------------------------------------
 // Chat history helpers
@@ -340,6 +345,61 @@ export async function getPendingPush(pushId: string): Promise<StagedPush | null>
     } catch (error) {
         console.error(
             `[redis] getPendingPush failed for pushId="${pushId}":`,
+            error instanceof Error ? error.message : error
+        );
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push-only staging (push without committing)
+// ---------------------------------------------------------------------------
+
+/** Staged push-only request for a pure `git push` flow. */
+export interface StagedPushOnly {
+    workspace_path: string;
+}
+
+/**
+ * Stage a push-only request (workspace path) and return an id for the approval button.
+ */
+export async function stagePushOnly(workspacePath: string): Promise<string> {
+    const redis = getRedisClient();
+    const pushOnlyId = Math.random().toString(36).slice(2, 10);
+    const key = pushOnlyKey(pushOnlyId);
+    const value: StagedPushOnly = {
+        workspace_path: workspacePath.trim(),
+    };
+    try {
+        await redis.set(key, JSON.stringify(value), { ex: PATCH_TTL_SECONDS });
+    } catch (error) {
+        console.error(
+            `[redis] stagePushOnly failed for pushOnlyId="${pushOnlyId}":`,
+            error instanceof Error ? error.message : error
+        );
+    }
+    return pushOnlyId;
+}
+
+/**
+ * Retrieve a staged push-only request by id. Returns null if expired or not found.
+ * Handles both string (JSON) and already-parsed object from Redis.
+ */
+export async function getPendingPushOnly(pushOnlyId: string): Promise<StagedPushOnly | null> {
+    try {
+        const redis = getRedisClient();
+        const key = pushOnlyKey(pushOnlyId);
+        const value = await redis.get<string | StagedPushOnly | null>(key);
+        if (value == null) return null;
+        const parsed: StagedPushOnly =
+            typeof value === "object" && value !== null && "workspace_path" in value
+                ? (value as StagedPushOnly)
+                : (JSON.parse(value as string) as StagedPushOnly);
+        if (typeof parsed.workspace_path !== "string") return null;
+        return parsed;
+    } catch (error) {
+        console.error(
+            `[redis] getPendingPushOnly failed for pushOnlyId="${pushOnlyId}":`,
             error instanceof Error ? error.message : error
         );
         return null;

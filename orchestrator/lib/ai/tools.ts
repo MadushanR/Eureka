@@ -12,7 +12,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import type { InteractiveButton, StandardResponse } from "@/types/messaging";
-import { stagePatch, stagePush } from "@/lib/redis";
+import { stagePatch, stagePush, stagePushOnly } from "@/lib/redis";
 
 const LOCAL_DAEMON_BASE = () => process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
 
@@ -538,6 +538,44 @@ export const preparePushApproval = tool({
 });
 
 /**
+ * Tool: prepare_push_only_approval
+ * --------------------------------
+ * Push-only flow: ask the user to approve running `git push` in a repo that
+ * already has the desired commits. This does NOT stage or commit any changes.
+ */
+export const preparePushOnlyApproval = tool({
+    description:
+        "Push-only flow for a git repo. Use this when the user wants to push existing commits, even if there are no uncommitted changes. " +
+        "Call this with the absolute path to the repository; it will show an 'Approve & Push' button.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .min(1, "workspace_path must not be empty.")
+            .describe("Absolute path to the git repository root."),
+    }),
+    async execute({
+        workspace_path,
+    }: {
+        workspace_path: string;
+    }): Promise<StandardResponse | { success: boolean; error: string }> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+
+        const pushOnlyId = await stagePushOnly(workspace_path);
+        return {
+            text:
+                "This will run `git push` in the repository:\n" +
+                `\`${workspace_path}\`.\n\nApprove to push the current branch?`,
+            interactiveButtons: [
+                { action: `push_only:${pushOnlyId}`, label: "Approve & Push" },
+            ],
+        };
+    },
+});
+
+/**
  * Tool: delete_path
  * -----------------
  * Ask the local daemon to delete a file or folder within an allowed workspace.
@@ -743,6 +781,7 @@ export const aiTools = {
     search_local_codebase: searchLocalCodebase,
     request_patch_approval: requestPatchApproval,
     prepare_push_approval: preparePushApproval,
+    prepare_push_only_approval: preparePushOnlyApproval,
     list_git_repos: listGitRepos,
     list_workspace_folders: listWorkspaceFolders,
     list_folder_contents: listFolderContents,

@@ -39,7 +39,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { TelegramAdapter, type TelegramUpdate } from "@/lib/adapters/TelegramAdapter";
 import type { StandardMessage } from "@/types/messaging";
 import { processUserMessage } from "@/lib/ai/orchestrator";
-import { getPendingPatch, getPendingPush } from "@/lib/redis";
+import { getPendingPatch, getPendingPush, getPendingPushOnly } from "@/lib/redis";
 
 // ---------------------------------------------------------------------------
 // Environment variable loading (validated at module-initialisation time so
@@ -358,6 +358,77 @@ async function handlePushAction(message: StandardMessage): Promise<boolean> {
     return true;
 }
 
+/** Handle push-only button: run git push without staging/committing. */
+async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> {
+    const prefix = "push_only:";
+    if (!message.text.startsWith(prefix)) return false;
+
+    const pushOnlyId = message.text.slice(prefix.length).trim();
+    if (!pushOnlyId) return false;
+
+    const adapter = getAdapter();
+    if (message.callbackQueryId) {
+        await adapter.answerCallbackQuery(message.callbackQueryId);
+    }
+
+    const staged = await getPendingPushOnly(pushOnlyId);
+    if (!staged) {
+        await adapter.sendResponse(
+            { text: "This push request has expired. Ask again to create a new push-only approval." },
+            message.senderId
+        );
+        return true;
+    }
+
+    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
+    if (!daemonUrl) {
+        await adapter.sendResponse(
+            { text: "LOCAL_DAEMON_URL is not configured. Cannot push." },
+            message.senderId
+        );
+        return true;
+    }
+
+    try {
+        const res = await fetch(`${daemonUrl}/git/push-only`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                workspace_path: staged.workspace_path,
+            }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+            success?: boolean;
+            message?: string;
+            stdout?: string;
+            stderr?: string;
+        };
+
+        if (data.success) {
+            await adapter.sendResponse(
+                { text: `Push-only completed. ${data.message ?? ""}`.trim() },
+                message.senderId
+            );
+        } else {
+            const detail = [data.stdout, data.stderr].filter(Boolean).join("\n");
+            await adapter.sendResponse(
+                {
+                    text: `Push-only failed. ${data.message ?? "Unknown error."}${detail ? `\n\n${detail}` : ""}`,
+                },
+                message.senderId
+            );
+        }
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await adapter.sendResponse(
+            { text: `Failed to reach the daemon to push: ${msg}` },
+            message.senderId
+        );
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Downstream message processing — wired to the LLM orchestrator
 // ---------------------------------------------------------------------------
@@ -382,6 +453,12 @@ async function processMessage(message: StandardMessage): Promise<void> {
         // Handle "Approve & Apply" button: apply staged patch via daemon, then done.
         if (await handleApplyPatchAction(message)) {
             console.info(`[telegram/webhook] Apply-patch action handled for sender=${message.senderId}.`);
+            return;
+        }
+
+        // Handle push-only approval button: run git push only, then done.
+        if (await handlePushOnlyAction(message)) {
+            console.info(`[telegram/webhook] Push-only action handled for sender=${message.senderId}.`);
             return;
         }
 

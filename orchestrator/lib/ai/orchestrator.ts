@@ -204,8 +204,9 @@ export async function processUserMessage(
             "For deleting a file or folder, use the delete_path tool with the full absolute path. " +
             "When the user wants to work with a git repo (e.g. 'Eureka'), first call list_git_repos to discover all repos under the allowed workspaces " +
             "and resolve the correct repo path (for example, a repo named 'Eureka' will usually live at C:\\Users\\madus\\Desktop\\Eureka). " +
-            "When the user wants to push: first call prepare_push_approval(workspace_path) without a commit message to show the diff and ask for a commit message. " +
-            "When they reply with a message (or 'default'), call prepare_push_approval(workspace_path, commit_message) with their reply to show the Approve & Push button.",
+            "When the user wants to stage and push new changes (e.g. 'push my changes'), first call prepare_push_approval(workspace_path) without a commit message to show the diff and ask for a commit message. " +
+            "When they reply with a message (or 'default'), call prepare_push_approval(workspace_path, commit_message) with their reply to show the Approve & Push button. " +
+            "When the user wants to push existing commits even if there are no uncommitted changes (e.g. 'push my commits', 'push even if no uncommitted changes'), call prepare_push_only_approval(workspace_path) instead, which will show a push-only approval button.",
     };
 
     const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
