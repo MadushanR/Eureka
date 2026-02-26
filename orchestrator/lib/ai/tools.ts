@@ -224,7 +224,8 @@ export const listWorkspaceFolders = tool({
 export const listGitRepos = tool({
     description:
         "Find git repositories under the allowed workspaces on the local machine. " +
-        "Use this to resolve project names like 'Eureka' to absolute repo paths before running git operations.",
+        "Use this to resolve project names like 'Eureka' to absolute repo paths. " +
+        "When the user asked to edit or remove something in a repo, you MUST call this first and then immediately call remove_line, remove_lines_matching, get_uncommitted_changes, or prepare_push_approval with the path from the result — do not reply to the user with only this repo list.",
     // No input parameters — just scan all allowed workspaces.
     inputSchema: z
         .object({})
@@ -648,7 +649,7 @@ export const removeLinesMatching = tool({
     description:
         "Remove all lines that contain a given pattern (literal text) from a file or from all files in a repo. " +
         "Use when the user asks to remove lines containing some text (e.g. 'Remove #testing from Eureka', 'Remove all lines that say #testing from all files in Eureka'). " +
-        "For a single file, pass file_path. For all files, omit file_path. Call list_git_repos first to get workspace_path.",
+        "You MUST call list_git_repos first, then call this with workspace_path set to the path of the repo the user named (e.g. from repos[0].path). For a single file pass file_path; for all files omit file_path.",
     inputSchema: z.object({
         workspace_path: z
             .string()
