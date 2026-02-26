@@ -193,23 +193,15 @@ export async function processUserMessage(
         content: text,
     };
 
-    // Prepend system instruction so the model always replies after using tools.
+    // Prepend system instruction. Keep it short; tool descriptions define when to use each tool.
     const systemMessage: ModelMessage = {
         role: "system",
         content:
-            "You are a helpful coding assistant. When you use a tool (search, list folders, etc.), " +
-            "always end with a short reply to the user summarizing what you did or found. Never leave the user without a text response. " +
-            "The 'Approve & Apply' button is only for applying code patches (unified diff / git apply). " +
-            "Do NOT use it for moving files or other non-code tasks. " +
-            "For deleting a file or folder, use the delete_path tool with the full absolute path. " +
-            "When the user wants to work with a git repo (e.g. 'Eureka'), first call list_git_repos to discover all repos under the allowed workspaces " +
-            "and resolve the correct repo path (for example, a repo named 'Eureka' will usually live at C:\\Users\\madus\\Desktop\\Eureka). " +
-            "When the user asks about uncommitted changes (e.g. 'any uncommitted changes?', 'uncommitted changes in Eureka', 'show changes in all repos'), call get_uncommitted_changes(workspace_path) for one repo (use list_git_repos first to get the path) or get_uncommitted_changes() with no argument for all repos. Do NOT reply with only the list of repos when they asked for uncommitted changes — always call get_uncommitted_changes. " +
-            "When the user asks to remove a specific line or line range from a file (e.g. 'Remove line 10 from Eureka/src/main.py'), you MUST call list_git_repos then remove_line(workspace_path, file_path, line_number) in the same turn. Use the repo path from list_git_repos as workspace_path. Never reply with only the list of repos. " +
-            "When the user asks to remove all lines containing some text (e.g. 'Remove #testing from Eureka', 'Remove #testing from all files in Eureka', 'Remove all lines that say #testing'), you MUST call list_git_repos then remove_lines_matching(workspace_path, pattern) in the same turn. Use the repo path from list_git_repos. Never reply with only the list of repos — always call remove_lines_matching so the user gets the Approve & Apply button. Use file_path only when they name a single file. " +
-            "When the user wants to stage and push new changes (e.g. 'push my changes'), first call prepare_push_approval(workspace_path) without a commit message to show the diff and ask for a commit message. " +
-            "When they reply with a message (or 'default'), call prepare_push_approval(workspace_path, commit_message) with their reply to show the Approve & Push button. " +
-            "When the user wants to push existing commits even if there are no uncommitted changes (e.g. 'push my commits', 'push even if no uncommitted changes'), call prepare_push_only_approval(workspace_path) instead, which will show a push-only approval button.",
+            "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
+            "Use the available tools based on their descriptions; do not follow fixed recipes. " +
+            "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, or remove_lines_matching) so they can resolve the path themselves. " +
+            "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
+            "Always finish with a concise reply that explains what you did or found.",
     };
 
     const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
