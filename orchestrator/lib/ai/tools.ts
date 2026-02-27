@@ -669,6 +669,110 @@ export const runTests = tool({
 });
 
 /**
+ * Tool: delete_code
+ * -----------------
+ * Delete an entire function, class, or endpoint block from a file.
+ * Provide a search_term that uniquely identifies the block (e.g. '/testing',
+ * 'def ping', 'async def health'). The daemon finds the full block
+ * (including decorators and docstring) and generates a deletion patch.
+ */
+export const deleteCode = tool({
+    description:
+        "Delete an entire function, class, or endpoint block from a Python file. " +
+        "Provide a search_term that uniquely identifies the block to delete (e.g. '/testing', 'def ping', 'class UserModel'). " +
+        "The daemon finds the full block including decorators and docstring and generates a deletion patch. " +
+        "The user will get an 'Approve & Apply' button to confirm.",
+    inputSchema: z.object({
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Optional repo name (e.g. 'Eureka'). Resolved to a workspace path."),
+        workspace_path: z
+            .string()
+            .optional()
+            .describe("Optional absolute path to the git repo root."),
+        file_path: z
+            .string()
+            .min(1, "file_path must not be empty.")
+            .describe("Path to the file relative to the repo root (e.g. 'rag-daemon/main.py')."),
+        search_term: z
+            .string()
+            .min(1, "search_term must not be empty.")
+            .describe(
+                "A string that uniquely identifies the block to delete. " +
+                "Examples: '/testing' for a GET /testing endpoint, 'def ping' for a ping function, 'class UserModel' for a class.",
+            ),
+    }),
+    async execute({
+        repo_name,
+        workspace_path,
+        file_path,
+        search_term,
+    }: {
+        repo_name?: string;
+        workspace_path?: string;
+        file_path: string;
+        search_term: string;
+    }): Promise<StandardResponse> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { text: "LOCAL_DAEMON_URL is not configured." };
+        }
+        const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
+        let workspace = workspace_path?.trim();
+        if (!workspace && repo_name) {
+            workspace = (await resolveRepoName(repo_name)) ?? undefined;
+        }
+        if (!workspace) workspace = DEFAULT_WORKSPACE;
+        if (!workspace) {
+            return { text: "Could not determine workspace." };
+        }
+
+        try {
+            const res = await fetch(`${base}/edit/delete-block`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path: workspace,
+                    file_path,
+                    search_term,
+                }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                message?: string;
+                patch?: string;
+                deleted_lines?: string;
+            };
+            if (!res.ok || data.success === false) {
+                const err = data.message ?? `Daemon returned ${res.status}`;
+                return { text: `Delete failed: ${err}` };
+            }
+            const patch = data.patch ?? "";
+            if (!patch) {
+                return { text: "Daemon reported success but returned no patch." };
+            }
+
+            console.info("[tools.delete_code] Block to delete:\n", (data.deleted_lines ?? "").slice(0, 500));
+
+            const patchId = await stagePatch(patch, workspace);
+            const buttons: ReadonlyArray<InteractiveButton> = [
+                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+            ];
+
+            const preview = (data.deleted_lines ?? "").slice(0, 500);
+            return {
+                text: `I found the block to delete:\n\n\`\`\`\n${preview}\n\`\`\`\n\nPress **Approve & Apply** to remove it.`,
+                interactiveButtons: buttons,
+            };
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { text: `Failed to reach daemon: ${msg}` };
+        }
+    },
+});
+
+/**
  * Tool: insert_code
  * -----------------
  * Add new code to a file by inserting after a specific line number.
@@ -1439,6 +1543,7 @@ export const systemLock = tool({
  */
 export const aiTools = {
     search_local_codebase: searchLocalCodebase,
+    delete_code: deleteCode,
     insert_code: insertCode,
     edit_file: editFile,
     request_patch_approval: requestPatchApproval,

@@ -225,7 +225,8 @@ export interface ProcessUserMessageOptions {
 const SYSTEM_PROMPT_NORMAL =
     "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
-    "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, or remove_lines_matching) so they can resolve the path themselves. " +
+    "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, remove_lines_matching, or delete_code) so they can resolve the path themselves. " +
+    "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
     "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
     "Always finish with a concise reply that explains what you did or found.";
 
@@ -235,6 +236,7 @@ const SYSTEM_PROMPT_DEV =
     "- read_file: Read a file's contents (with line numbers). Always read the target file first.\n" +
     "- insert_code: INSERT NEW CODE after a specific line number. Use this for adding new features, endpoints, functions, classes. Provide file_path, after_line (line number from read_file output), and new_code.\n" +
     "- edit_file: MODIFY EXISTING CODE via search/replace. Use this for changing or fixing existing code. Provide file_path, search_string, replace_string.\n" +
+    "- delete_code: DELETE an entire function, class, or endpoint block. Provide file_path and search_term (e.g. '/testing' or 'def ping').\n" +
     "- search_local_codebase: Semantic code search to find relevant files.\n" +
     "- run_tests: Run tests after changes.\n" +
     "- list_git_repos, get_uncommitted_changes: Git helpers.\n" +

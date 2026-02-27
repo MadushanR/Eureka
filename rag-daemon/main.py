@@ -91,9 +91,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 # These are set during the ``lifespan`` startup hook and used in route handlers.
-@app.get("/testing")
-async def testing():
-    return {"testing": True}
+
 _indexer: Optional[CodeIndexer] = None
 _chroma_collection: Optional[chromadb.Collection] = None
 _embed_model: Optional[SentenceTransformer] = None
@@ -301,6 +299,36 @@ class InsertCodeResponse(BaseModel):
     success: bool
     message: str = ""
     patch: str = ""
+
+
+class DeleteBlockRequest(BaseModel):
+    """Payload for /edit/delete-block."""
+
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the git workspace root.")
+    file_path: str = Field(..., min_length=1, description="Path to file, relative to workspace root.")
+    search_term: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "A string that uniquely identifies the function/class/endpoint to delete. "
+            "For example: '/testing' or 'def ping' or 'async def health'. "
+            "The daemon finds the top-level block (including decorators and docstring) that contains this string."
+        ),
+    )
+
+    @field_validator("workspace_path", "file_path")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Must not be blank.")
+        return v
+
+
+class DeleteBlockResponse(BaseModel):
+    success: bool
+    message: str = ""
+    patch: str = ""
+    deleted_lines: str = ""
 
 
 class IndexNowResponse(BaseModel):
@@ -1954,6 +1982,152 @@ async def insert_code(request: InsertCodeRequest) -> InsertCodeResponse:
         request.new_code,
     )
     return InsertCodeResponse(success=success, message=message, patch=patch)
+
+
+def _find_python_block(lines: List[str], search_term: str) -> Optional[tuple[int, int]]:
+    """
+    Find the top-level Python block (function, class, or decorated endpoint) that
+    contains search_term. Returns (start_idx, end_idx) as 0-based line indices
+    where start_idx is the first line of the block (including leading decorators)
+    and end_idx is the last line of the block (exclusive — i.e. the line where
+    the next top-level block starts, or len(lines)).
+
+    A "top-level block" is a contiguous run of lines starting with a decorator (@)
+    or def/async def/class at column 0, followed by indented lines (and blank lines
+    between them).
+    """
+    # Find all lines that match the search_term
+    candidate_lines = [i for i, line in enumerate(lines) if search_term in line]
+    if not candidate_lines:
+        return None
+
+    def _is_toplevel_start(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped:
+            return False
+        if line[0] == " " or line[0] == "\t":
+            return False
+        return stripped.startswith(("def ", "async def ", "class ", "@"))
+
+    def _is_decorator(line: str) -> bool:
+        return line.lstrip().startswith("@") and (not line[0].isspace())
+
+    # For each candidate, walk backwards to find the block start (including decorators),
+    # then walk forward to find the block end.
+    for candidate_idx in candidate_lines:
+        # Walk back to find the start of this block
+        block_body_start = candidate_idx
+        # First, find the def/class line at or above the candidate
+        def_line = candidate_idx
+        while def_line >= 0:
+            stripped = lines[def_line].lstrip()
+            if stripped.startswith(("def ", "async def ", "class ")):
+                break
+            if _is_decorator(lines[def_line]):
+                break
+            def_line -= 1
+        if def_line < 0:
+            continue
+
+        # Walk further back to include decorators
+        block_start = def_line
+        while block_start > 0 and _is_decorator(lines[block_start - 1]):
+            block_start -= 1
+
+        # Walk forward from def_line to find end of block.
+        # The body consists of indented lines. Blank lines between indented
+        # lines are part of the body, but blank lines followed by a non-indented
+        # line are NOT (they're separators between blocks).
+        block_end = def_line + 1
+        while block_end < len(lines):
+            line = lines[block_end]
+            # Indented line → part of the body
+            if line.strip() and (line[0] == " " or line[0] == "\t"):
+                block_end += 1
+                continue
+            # Blank line → only include if followed by more indented body
+            if line.strip() == "":
+                lookahead = block_end + 1
+                while lookahead < len(lines) and lines[lookahead].strip() == "":
+                    lookahead += 1
+                if lookahead < len(lines) and lines[lookahead].strip() and (lines[lookahead][0] == " " or lines[lookahead][0] == "\t"):
+                    block_end = lookahead
+                    continue
+                break
+            # Non-indented, non-blank → next top-level thing, stop
+            break
+
+        # Trim trailing blank lines from the block
+        while block_end > block_start and lines[block_end - 1].strip() == "":
+            block_end -= 1
+
+        return (block_start, block_end)
+
+    return None
+
+
+def _delete_block_sync(
+    workspace_path: str,
+    file_path: str,
+    search_term: str,
+) -> tuple[bool, str, str, str]:
+    """Find and delete a top-level block containing search_term. Returns (success, message, patch, deleted_lines_preview)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(workspace_path)
+    if not allowed:
+        return False, "Workspace path is not in ALLOWED_WORKSPACES.", "", ""
+    try:
+        full_path = (resolved_workspace / file_path.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return False, "file_path is not inside the given workspace.", "", ""
+    if not full_path.is_file():
+        return False, f"File does not exist: {file_path}", "", ""
+    original = _edit_read_text(full_path)
+    if original is None:
+        return False, "File could not be read as text.", "", ""
+
+    lines = original.splitlines(keepends=True)
+    lines_stripped = [l.rstrip("\n").rstrip("\r") for l in lines]
+    result = _find_python_block(lines_stripped, search_term)
+    if result is None:
+        return False, f"No top-level block containing '{search_term}' was found in {file_path}.", "", ""
+
+    block_start, block_end = result
+    deleted_preview = "".join(lines[block_start:block_end]).strip()
+    # Build the new file without the block. Remove at most 1 blank line after
+    # to avoid leaving excessive gaps, but keep other blank lines intact.
+    remove_trailing = 0
+    if block_end < len(lines) and lines[block_end].strip() == "":
+        remove_trailing = 1
+    new_lines = lines[:block_start] + lines[block_end + remove_trailing:]
+    new_text = "".join(new_lines)
+
+    rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
+    patch = _build_unified_diff(rel_path_str, original, new_text)
+    if not patch:
+        return False, "Diff was empty after deletion.", "", ""
+    return True, f"Block deleted (lines {block_start + 1}-{block_end}).", patch, deleted_preview[:500]
+
+
+@app.post(
+    "/edit/delete-block",
+    response_model=DeleteBlockResponse,
+    tags=["Edit"],
+    summary="Compute a patch that deletes a top-level function/class/endpoint block",
+)
+async def delete_block(request: DeleteBlockRequest) -> DeleteBlockResponse:
+    """
+    Find the top-level Python block (function, class, decorated endpoint) that
+    contains search_term, and return a unified diff that removes it.
+    Does NOT write to disk.
+    """
+    success, message, patch, deleted = await asyncio.to_thread(
+        _delete_block_sync,
+        request.workspace_path,
+        request.file_path,
+        request.search_term,
+    )
+    return DeleteBlockResponse(success=success, message=message, patch=patch, deleted_lines=deleted)
 
 
 @app.post(
