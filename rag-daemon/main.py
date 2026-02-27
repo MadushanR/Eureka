@@ -331,6 +331,27 @@ class DeleteBlockResponse(BaseModel):
     deleted_lines: str = ""
 
 
+class CreateFileRequest(BaseModel):
+    """Payload for /create-file."""
+
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the git workspace root.")
+    file_path: str = Field(..., min_length=1, description="Path for the new file, relative to workspace root (e.g. 'src/auth.py').")
+    content: str = Field(..., description="Full content of the new file.")
+
+    @field_validator("workspace_path", "file_path")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Must not be blank.")
+        return v
+
+
+class CreateFileResponse(BaseModel):
+    success: bool
+    message: str = ""
+    path: str = ""
+
+
 class IndexNowResponse(BaseModel):
     message: str
 
@@ -427,6 +448,19 @@ RUN_COMMAND_WHITELIST = frozenset({
     "pytest",
     "python -m pytest",
     "dotnet test",
+    "npm install",
+    "npm ci",
+    "yarn install",
+    "pnpm install",
+    "pip install -r requirements.txt",
+    "npm run build",
+    "yarn build",
+    "pnpm build",
+    "npm run lint",
+    "yarn lint",
+    "pnpm lint",
+    "python -m py_compile",
+    "npx tsc --noEmit",
 })
 
 
@@ -1453,6 +1487,105 @@ async def read_file(request: ReadFileRequest) -> ReadFileResponse:
     numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(selected)]
     content = "\n".join(numbered)
     return ReadFileResponse(success=True, path=str(resolved), content=content, total_lines=total)
+
+
+@app.post(
+    "/create-file",
+    response_model=CreateFileResponse,
+    tags=["System"],
+    summary="Create a new file within an allowed workspace",
+)
+async def create_file(request: CreateFileRequest) -> CreateFileResponse:
+    """
+    Create a new file at file_path (relative to workspace_path).
+    Fails if the file already exists or the path is outside ALLOWED_WORKSPACES.
+    Parent directories are created automatically.
+    """
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return CreateFileResponse(success=False, message="Workspace path is not within any allowed workspace.")
+    try:
+        full_path = (resolved_workspace / request.file_path.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return CreateFileResponse(success=False, message="file_path escapes the workspace boundary.")
+    if full_path.exists():
+        return CreateFileResponse(success=False, message=f"File already exists: {request.file_path}")
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(request.content, encoding="utf-8")
+        logger.info("Created file: %s", full_path)
+        return CreateFileResponse(success=True, message=f"Created {request.file_path}", path=str(full_path))
+    except OSError as exc:
+        logger.warning("Failed to create file '%s': %s", full_path, exc)
+        return CreateFileResponse(success=False, message=f"Failed to create file: {exc!s}")
+
+
+# ---------------------------------------------------------------------------
+# Batch create-files
+# ---------------------------------------------------------------------------
+
+class BatchFileEntry(BaseModel):
+    file_path: str = Field(..., min_length=1, description="Relative path within the workspace (e.g. 'src/auth.py').")
+    content: str = Field(..., description="Full content for this file.")
+
+
+class BatchCreateFilesRequest(BaseModel):
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the workspace root.")
+    files: List[BatchFileEntry] = Field(..., min_length=1, description="List of files to create.")
+
+
+class BatchFileResult(BaseModel):
+    file_path: str
+    success: bool
+    message: str = ""
+
+
+class BatchCreateFilesResponse(BaseModel):
+    success: bool
+    results: List[BatchFileResult]
+    created: int = 0
+    failed: int = 0
+
+
+@app.post(
+    "/create-files",
+    response_model=BatchCreateFilesResponse,
+    tags=["System"],
+    summary="Batch-create multiple files in a single call",
+)
+async def batch_create_files(request: BatchCreateFilesRequest) -> BatchCreateFilesResponse:
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return BatchCreateFilesResponse(success=False, results=[], created=0, failed=len(request.files))
+
+    results: List[BatchFileResult] = []
+    created = 0
+    failed = 0
+    for entry in request.files:
+        try:
+            full_path = (resolved_workspace / entry.file_path.replace("\\", "/").strip("/")).resolve()
+            full_path.relative_to(resolved_workspace)
+        except (ValueError, OSError):
+            results.append(BatchFileResult(file_path=entry.file_path, success=False, message="Path escapes workspace."))
+            failed += 1
+            continue
+        if full_path.exists():
+            results.append(BatchFileResult(file_path=entry.file_path, success=False, message="File already exists."))
+            failed += 1
+            continue
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(entry.content, encoding="utf-8")
+            logger.info("Batch-created file: %s", full_path)
+            results.append(BatchFileResult(file_path=entry.file_path, success=True, message="Created."))
+            created += 1
+        except OSError as exc:
+            logger.warning("Batch create failed for '%s': %s", full_path, exc)
+            results.append(BatchFileResult(file_path=entry.file_path, success=False, message=str(exc)))
+            failed += 1
+
+    return BatchCreateFilesResponse(success=(failed == 0), results=results, created=created, failed=failed)
 
 
 def _run_command_sync(workspace_path: Path, command_line: str) -> tuple[bool, str, str, int]:

@@ -40,7 +40,7 @@ import { TelegramAdapter, type TelegramUpdate } from "@/lib/adapters/TelegramAda
 import type { StandardMessage } from "@/types/messaging";
 import { processUserMessage, isDevFeatureRequest } from "@/lib/ai/orchestrator";
 import { buildPushCompletionUrl } from "@/lib/pushCallback";
-import { getPendingPatch, getPendingPush, getPendingPushOnly } from "@/lib/redis";
+import { getPendingPatch, getPendingPush, getPendingPushOnly, getActiveJob, updateJob } from "@/lib/redis";
 
 // ---------------------------------------------------------------------------
 // Environment variable loading (validated at module-initialisation time so
@@ -497,14 +497,71 @@ async function processMessage(message: StandardMessage): Promise<void> {
             return;
         }
 
-        // Dev feature requests: send "working on it" first, then run dev-agent and send summary.
+        // "status" command: return progress of active dev job
+        const lowerText = message.text.trim().toLowerCase();
+        if (lowerText === "status" || lowerText === "/status") {
+            const activeJob = await getActiveJob(message.senderId);
+            if (!activeJob) {
+                await getAdapter().sendResponse({ text: "No active job running." }, message.senderId);
+            } else {
+                const elapsed = Math.round((Date.now() - activeJob.started_at) / 1000);
+                const lines = [
+                    `Job: ${activeJob.goal.slice(0, 80)}`,
+                    `Status: ${activeJob.status}`,
+                    `Step: ${activeJob.current_step}/${activeJob.total_steps}`,
+                    `Current: ${activeJob.current_action}`,
+                    `Elapsed: ${elapsed}s`,
+                ];
+                if (activeJob.steps_completed.length > 0) {
+                    lines.push(`Done: ${activeJob.steps_completed.join(", ")}`);
+                }
+                if (activeJob.errors.length > 0) {
+                    lines.push(`Errors: ${activeJob.errors.slice(-2).join("; ")}`);
+                }
+                await getAdapter().sendResponse({ text: lines.join("\n") }, message.senderId);
+            }
+            return;
+        }
+
+        // "cancel" command: cancel active dev job
+        if (lowerText === "cancel" || lowerText === "/cancel") {
+            const activeJob = await getActiveJob(message.senderId);
+            if (!activeJob) {
+                await getAdapter().sendResponse({ text: "No active job to cancel." }, message.senderId);
+            } else {
+                await updateJob(activeJob.id, { status: "cancelled", finished_at: Date.now() });
+                await getAdapter().sendResponse(
+                    { text: `Cancelled job: ${activeJob.goal.slice(0, 80)}\n(Note: changes already applied to files remain.)` },
+                    message.senderId,
+                );
+            }
+            return;
+        }
+
+        // Dev feature requests: send immediate ack, then run dev-agent with progress updates.
         if (isDevFeatureRequest(message.text)) {
-            await getAdapter().sendResponse(
-                { text: "I'm working on it. I'll message you when I have an update." },
-                message.senderId
+            const tgAdapter = getAdapter();
+            await tgAdapter.sendResponse(
+                { text: "Starting dev agent. I'll send you live updates as I work." },
+                message.senderId,
             );
-            const { response } = await processUserMessage(message, { devMode: true });
-            await getAdapter().sendResponse(response, message.senderId);
+
+            let lastProgressTime = 0;
+            const MIN_PROGRESS_INTERVAL_MS = 3000;
+
+            const onProgress = async (update: string) => {
+                const now = Date.now();
+                if (now - lastProgressTime < MIN_PROGRESS_INTERVAL_MS) return;
+                lastProgressTime = now;
+                try {
+                    await tgAdapter.sendResponse({ text: `[progress] ${update}` }, message.senderId);
+                } catch (e) {
+                    console.error(`[telegram/webhook] Failed to send progress update:`, e);
+                }
+            };
+
+            const { response } = await processUserMessage(message, { devMode: true, onProgress });
+            await tgAdapter.sendResponse(response, message.senderId);
             console.info(`[telegram/webhook] Dev flow completed; summary sent to sender=${message.senderId}.`);
             return;
         }

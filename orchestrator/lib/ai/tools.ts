@@ -669,6 +669,146 @@ export const runTests = tool({
 });
 
 /**
+ * Tool: create_file
+ * -----------------
+ * Create a new file in the workspace. Parent directories are created automatically.
+ */
+export const createFile = tool({
+    description:
+        "Create a new file in the workspace. Use when you need to add a completely new file (e.g. a new module, config, test file). " +
+        "Provide file_path (relative to repo root, e.g. 'src/auth.py') and the full content. " +
+        "Fails if the file already exists — use edit_file or insert_code for existing files.",
+    inputSchema: z.object({
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Optional repo name (e.g. 'Eureka')."),
+        workspace_path: z
+            .string()
+            .optional()
+            .describe("Optional absolute path to the git repo root."),
+        file_path: z
+            .string()
+            .min(1, "file_path must not be empty.")
+            .describe("Path for the new file relative to the repo root (e.g. 'src/auth.py')."),
+        content: z
+            .string()
+            .min(1, "content must not be empty.")
+            .describe("Full content of the new file."),
+    }),
+    async execute({
+        repo_name,
+        workspace_path,
+        file_path,
+        content,
+    }: {
+        repo_name?: string;
+        workspace_path?: string;
+        file_path: string;
+        content: string;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
+        let workspace = workspace_path?.trim();
+        if (!workspace && repo_name) {
+            workspace = (await resolveRepoName(repo_name)) ?? undefined;
+        }
+        if (!workspace) workspace = DEFAULT_WORKSPACE;
+        if (!workspace) {
+            return { success: false, error: "Could not determine workspace." };
+        }
+        try {
+            const res = await fetch(`${base}/create-file`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ workspace_path: workspace, file_path, content }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                message?: string;
+                path?: string;
+            };
+            if (!res.ok || data.success === false) {
+                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
+            }
+            return data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+        }
+    },
+});
+
+/**
+ * Tool: batch_create_files
+ * ------------------------
+ * Create multiple files in one call. Useful when building a new feature that spans several files.
+ */
+export const batchCreateFiles = tool({
+    description:
+        "Create multiple new files in a single call. Use when building a feature that requires several new files " +
+        "(e.g. a new module with routes, models, and tests). Each entry needs file_path and content.",
+    inputSchema: z.object({
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Optional repo name (e.g. 'Eureka')."),
+        workspace_path: z
+            .string()
+            .optional()
+            .describe("Optional absolute path to the workspace root."),
+        files: z
+            .array(
+                z.object({
+                    file_path: z.string().min(1).describe("Relative path (e.g. 'src/auth/routes.py')."),
+                    content: z.string().min(1).describe("Full content of the file."),
+                }),
+            )
+            .min(1, "Provide at least one file."),
+    }),
+    async execute({
+        repo_name,
+        workspace_path,
+        files,
+    }: {
+        repo_name?: string;
+        workspace_path?: string;
+        files: Array<{ file_path: string; content: string }>;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
+        let workspace = workspace_path?.trim();
+        if (!workspace && repo_name) {
+            workspace = (await resolveRepoName(repo_name)) ?? undefined;
+        }
+        if (!workspace) workspace = DEFAULT_WORKSPACE;
+        if (!workspace) return { success: false, error: "Could not determine workspace." };
+        try {
+            const res = await fetch(`${base}/create-files`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ workspace_path: workspace, files }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                results?: Array<{ file_path: string; success: boolean; message: string }>;
+                created?: number;
+                failed?: number;
+            };
+            if (!res.ok || data.success === false) {
+                return { success: false, error: `${data.failed ?? 0} file(s) failed.`, results: data.results };
+            }
+            return data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+        }
+    },
+});
+
+/**
  * Tool: delete_code
  * -----------------
  * Delete an entire function, class, or endpoint block from a file.
@@ -1543,6 +1683,8 @@ export const systemLock = tool({
  */
 export const aiTools = {
     search_local_codebase: searchLocalCodebase,
+    create_file: createFile,
+    batch_create_files: batchCreateFiles,
     delete_code: deleteCode,
     insert_code: insertCode,
     edit_file: editFile,

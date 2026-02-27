@@ -97,6 +97,10 @@ const commitKey = (commitId: string): string => `commit:${commitId}`;
  */
 const pushOnlyKey = (pushOnlyId: string): string => `pushonly:${pushOnlyId}`;
 
+const jobKey = (jobId: string): string => `job:${jobId}`;
+const activeJobKey = (senderId: string): string => `activejob:${senderId}`;
+const JOB_TTL_SECONDS = 2 * 60 * 60; // 2 hours
+
 // ---------------------------------------------------------------------------
 // Chat history helpers
 // ---------------------------------------------------------------------------
@@ -403,5 +407,94 @@ export async function getPendingPushOnly(pushOnlyId: string): Promise<StagedPush
             error instanceof Error ? error.message : error
         );
         return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job manager (dev-agent job tracking)
+// ---------------------------------------------------------------------------
+
+export interface DevJob {
+    id: string;
+    sender_id: string;
+    goal: string;
+    status: "planning" | "executing" | "complete" | "failed" | "cancelled";
+    plan: string[];
+    current_step: number;
+    total_steps: number;
+    current_action: string;
+    steps_completed: string[];
+    errors: string[];
+    files_created: string[];
+    started_at: number;
+    finished_at?: number;
+}
+
+export async function createJob(senderId: string, goal: string): Promise<DevJob> {
+    const redis = getRedisClient();
+    const id = Math.random().toString(36).slice(2, 10);
+    const job: DevJob = {
+        id,
+        sender_id: senderId,
+        goal,
+        status: "planning",
+        plan: [],
+        current_step: 0,
+        total_steps: 0,
+        current_action: "Planning...",
+        steps_completed: [],
+        errors: [],
+        files_created: [],
+        started_at: Date.now(),
+    };
+    try {
+        await redis.set(jobKey(id), JSON.stringify(job), { ex: JOB_TTL_SECONDS });
+        await redis.set(activeJobKey(senderId), id, { ex: JOB_TTL_SECONDS });
+    } catch (error) {
+        console.error(`[redis] createJob failed:`, error instanceof Error ? error.message : error);
+    }
+    return job;
+}
+
+export async function getJob(jobId: string): Promise<DevJob | null> {
+    try {
+        const redis = getRedisClient();
+        const value = await redis.get<string | DevJob | null>(jobKey(jobId));
+        if (value == null) return null;
+        return typeof value === "object" ? value as DevJob : JSON.parse(value as string) as DevJob;
+    } catch (error) {
+        console.error(`[redis] getJob failed:`, error instanceof Error ? error.message : error);
+        return null;
+    }
+}
+
+export async function updateJob(jobId: string, updates: Partial<DevJob>): Promise<void> {
+    try {
+        const existing = await getJob(jobId);
+        if (!existing) return;
+        const updated = { ...existing, ...updates };
+        await getRedisClient().set(jobKey(jobId), JSON.stringify(updated), { ex: JOB_TTL_SECONDS });
+    } catch (error) {
+        console.error(`[redis] updateJob failed:`, error instanceof Error ? error.message : error);
+    }
+}
+
+export async function getActiveJob(senderId: string): Promise<DevJob | null> {
+    try {
+        const redis = getRedisClient();
+        const jobId = await redis.get<string>(activeJobKey(senderId));
+        if (!jobId) return null;
+        return getJob(jobId);
+    } catch (error) {
+        console.error(`[redis] getActiveJob failed:`, error instanceof Error ? error.message : error);
+        return null;
+    }
+}
+
+export async function clearActiveJob(senderId: string): Promise<void> {
+    try {
+        await getRedisClient().del(activeJobKey(senderId));
+    } catch (error) {
+        console.error(`[redis] clearActiveJob failed:`, error instanceof Error ? error.message : error);
     }
 }

@@ -20,7 +20,7 @@
 import { generateText, type ModelMessage } from "ai";
 import { openai } from "@ai-sdk/openai";
 import type { StandardMessage, StandardResponse } from "@/types/messaging";
-import { getChatHistory, saveChatMessages } from "@/lib/redis";
+import { getChatHistory, saveChatMessages, createJob, updateJob, clearActiveJob, type DevJob } from "@/lib/redis";
 import { aiTools } from "./tools";
 
 // ---------------------------------------------------------------------------
@@ -217,9 +217,13 @@ interface ProcessUserMessageResult {
     response: StandardResponse;
 }
 
+export type ProgressCallback = (update: string) => Promise<void>;
+
 export interface ProcessUserMessageOptions {
     /** Use dev-agent prompt and more steps (plan, edit, test, summarize). */
     devMode?: boolean;
+    /** Called after each phase/step so the adapter can push live updates. */
+    onProgress?: ProgressCallback;
 }
 
 const SYSTEM_PROMPT_NORMAL =
@@ -230,24 +234,368 @@ const SYSTEM_PROMPT_NORMAL =
     "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
     "Always finish with a concise reply that explains what you did or found.";
 
-const SYSTEM_PROMPT_DEV =
-    "You are a dev agent. The user asked you to implement or build something (a feature, fix, or change). " +
-    "You have these tools:\n" +
-    "- read_file: Read a file's contents (with line numbers). Always read the target file first.\n" +
-    "- insert_code: INSERT NEW CODE after a specific line number. Use this for adding new features, endpoints, functions, classes. Provide file_path, after_line (line number from read_file output), and new_code.\n" +
-    "- edit_file: MODIFY EXISTING CODE via search/replace. Use this for changing or fixing existing code. Provide file_path, search_string, replace_string.\n" +
-    "- delete_code: DELETE an entire function, class, or endpoint block. Provide file_path and search_term (e.g. '/testing' or 'def ping').\n" +
-    "- search_local_codebase: Semantic code search to find relevant files.\n" +
-    "- run_tests: Run tests after changes.\n" +
-    "- list_git_repos, get_uncommitted_changes: Git helpers.\n" +
+const SYSTEM_PROMPT_DEV_PLAN =
+    "You are a planning agent. Given the user's request, produce a short numbered plan of concrete steps. " +
+    "Each step should name which tool to use and what arguments to pass.\n\n" +
+    "Available tools:\n" +
+    "- read_file(path, start_line?, end_line?): Read a file with line numbers.\n" +
+    "- insert_code(file_path, after_line, new_code, repo_name?): Insert new code after a line number. Use for adding new features.\n" +
+    "- edit_file(file_path, search_string, replace_string, repo_name?): Modify existing code via search/replace.\n" +
+    "- delete_code(file_path, search_term, repo_name?): Delete an entire function/class/endpoint block.\n" +
+    "- create_file(file_path, content, repo_name?): Create a single new file.\n" +
+    "- batch_create_files(files[], repo_name?): Create multiple new files at once (for multi-file features).\n" +
+    "- search_local_codebase(query): Semantic code search.\n" +
+    "- run_tests(workspace_path, command_line): Run tests/builds (npm test, pytest, npm install, npm run build, etc.).\n" +
+    "- list_git_repos, get_uncommitted_changes: Git helpers.\n\n" +
+    "Rules:\n" +
+    "- ALWAYS start by reading the target file(s) to see their current content and line numbers.\n" +
+    "- For new code, use insert_code. For modifications, use edit_file. For deletions, use delete_code.\n" +
+    "- For multi-file features, prefer batch_create_files to create all new files in one step.\n" +
+    "- Do NOT write unified diffs. The daemon generates them.\n" +
+    "- Keep the plan short (3-8 steps max).\n" +
+    "- Output ONLY the numbered plan, no other text.";
+
+const SYSTEM_PROMPT_DEV_EXECUTE =
+    "You are a dev agent executing a plan. Follow the plan below step by step using the available tools.\n\n" +
+    "Available tools:\n" +
+    "- read_file: Read a file's contents (with line numbers). Use start_line/end_line for large files.\n" +
+    "- insert_code: INSERT NEW CODE after a specific line number. Provide file_path, after_line, new_code.\n" +
+    "- edit_file: MODIFY EXISTING CODE via search/replace. Provide file_path, search_string, replace_string.\n" +
+    "- delete_code: DELETE an entire function/class/endpoint block. Provide file_path and search_term.\n" +
+    "- create_file: CREATE A SINGLE NEW FILE. Provide file_path and content.\n" +
+    "- batch_create_files: CREATE MULTIPLE NEW FILES at once. Provide an array of { file_path, content }.\n" +
+    "- search_local_codebase: Semantic code search.\n" +
+    "- run_tests: Run tests/build/install commands (npm test, pytest, npm install, npm run build, etc.).\n" +
+    "- list_git_repos, get_uncommitted_changes: Git helpers.\n\n" +
     "When the user names a repo (e.g. 'Eureka'), use repo_name in tools that accept it.\n\n" +
     "Critical rules:\n" +
-    "1. ALWAYS read the target file first with read_file so you can see line numbers.\n" +
-    "2. For ADDING new code (new endpoints, new functions, new features): use insert_code with after_line set to the line number after which to insert.\n" +
-    "3. For MODIFYING existing code: use edit_file with search_string and replace_string.\n" +
-    "4. Do NOT stop after read_file. You MUST follow through with insert_code or edit_file so the user gets an 'Approve & Apply' button.\n" +
-    "5. Do NOT write unified diffs yourself. The daemon generates them.\n" +
-    "Work step by step. End with a short summary of what you built or changed.";
+    "1. Execute each step of the plan in order.\n" +
+    "2. Do NOT stop after read_file — always follow through with the action tool (insert_code, edit_file, delete_code, create_file, or batch_create_files).\n" +
+    "3. Do NOT write unified diffs yourself. The daemon generates them.\n" +
+    "4. If a tool fails, try to fix the issue (e.g. re-read the file, adjust arguments) and retry.\n" +
+    "5. End with a short summary of what you did.";
+
+const SYSTEM_PROMPT_DEV_EVALUATE =
+    "You are a QA evaluator. The user asked for a specific change. The dev agent executed some steps. " +
+    "Based on the tool results below, determine: did the agent fully complete the task?\n\n" +
+    "Reply with EXACTLY one of:\n" +
+    "- COMPLETE: <one sentence summary of what was done>\n" +
+    "- INCOMPLETE: <what is still missing and what the agent should do next>\n" +
+    "- FAILED: <what went wrong>";
+
+// ---------------------------------------------------------------------------
+// Helper: run one generateText call and extract results
+// ---------------------------------------------------------------------------
+
+interface GenerateResult {
+    text: string;
+    toolResponse: StandardResponse | null;
+    allToolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }>;
+    hasApproveButton: boolean;
+}
+
+async function runGenerate(
+    messages: ModelMessage[],
+    maxSteps: number,
+): Promise<GenerateResult> {
+    const result = await generateText({
+        model,
+        messages,
+        tools: aiTools,
+        maxSteps,
+    } as Parameters<typeof generateText>[0]);
+
+    let text = "";
+    if (typeof result.text === "string" && result.text.trim().length > 0) {
+        text = result.text.trim();
+    }
+
+    const allToolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }> = [];
+    if (Array.isArray(result.toolResults)) {
+        for (const tr of result.toolResults) {
+            allToolResults.push(tr as { result?: unknown; output?: unknown; toolName?: string });
+        }
+    }
+
+    let toolResponse: StandardResponse | null = null;
+    let hasApproveButton = false;
+    for (const toolResult of allToolResults) {
+        const value = toolResult.result ?? toolResult.output;
+        if (isStandardResponse(value)) {
+            toolResponse = value;
+            if (
+                value.interactiveButtons?.some(
+                    (b) => typeof b.action === "string" && b.action.startsWith("apply_patch:"),
+                )
+            ) {
+                hasApproveButton = true;
+            }
+            break;
+        }
+    }
+
+    if (!text && allToolResults.length > 0) {
+        const last = allToolResults[allToolResults.length - 1];
+        const value = last?.result ?? last?.output;
+        if (value !== undefined && value !== null) {
+            text = formatToolResultForUser(value, last.toolName);
+        }
+    }
+
+    return { text, toolResponse, allToolResults, hasApproveButton };
+}
+
+// ---------------------------------------------------------------------------
+// Normal (non-dev) orchestration
+// ---------------------------------------------------------------------------
+
+async function processNormal(
+    senderId: string,
+    text: string,
+    history: ModelMessage[],
+): Promise<ProcessUserMessageResult> {
+    const userMessage: ModelMessage = { role: "user", content: text };
+    const systemMessage: ModelMessage = { role: "system", content: SYSTEM_PROMPT_NORMAL };
+    const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
+
+    let finalText = "I'm sorry, I wasn't able to generate a response.";
+    let toolResponse: StandardResponse | null = null;
+
+    try {
+        const result = await runGenerate(messages, 5);
+        if (result.text) finalText = result.text;
+        if (result.toolResponse) toolResponse = result.toolResponse;
+    } catch (error) {
+        console.error(`[orchestrator] generateText failed for sender="${senderId}":`, error);
+        finalText = "I ran into an error while talking to the language model. Please try again in a moment.";
+    }
+
+    const assistantMessage: ModelMessage = { role: "assistant", content: finalText };
+    await saveChatMessages(senderId, [userMessage, assistantMessage]);
+
+    return { response: toolResponse ?? { text: finalText } };
+}
+
+// ---------------------------------------------------------------------------
+// Dev-mode agentic orchestration (plan → execute → evaluate → retry)
+// ---------------------------------------------------------------------------
+
+const MAX_DEV_ATTEMPTS = 3;
+
+function summariseToolCalls(results: Array<{ result?: unknown; output?: unknown; toolName?: string }>): string {
+    return results.map((tr) => {
+        const name = tr.toolName ?? "unknown_tool";
+        const value = tr.result ?? tr.output;
+        const preview = typeof value === "object" && value !== null
+            ? JSON.stringify(value).slice(0, 200)
+            : String(value ?? "").slice(0, 200);
+        return `${name}: ${preview}`;
+    }).join("\n");
+}
+
+function extractToolNames(results: Array<{ toolName?: string }>): string[] {
+    return results.map((r) => r.toolName ?? "unknown").filter((n) => n !== "unknown");
+}
+
+async function processDev(
+    senderId: string,
+    text: string,
+    history: ModelMessage[],
+    onProgress?: ProgressCallback,
+): Promise<ProcessUserMessageResult> {
+    const userMessage: ModelMessage = { role: "user", content: text };
+    const job = await createJob(senderId, text);
+
+    const progress = async (msg: string, jobUpdates?: Partial<DevJob>) => {
+        if (jobUpdates) await updateJob(job.id, jobUpdates);
+        if (onProgress) {
+            try { await onProgress(msg); } catch (e) {
+                console.error(`[orchestrator:dev] onProgress error:`, e);
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Plan
+    // -----------------------------------------------------------------------
+    console.info(`[orchestrator:dev] Phase 1 — Planning for sender="${senderId}"`);
+    await progress("Planning your request...", { status: "planning", current_action: "Planning..." });
+
+    let plan = "";
+    let planSteps: string[] = [];
+    try {
+        const planMessages: ModelMessage[] = [
+            { role: "system", content: SYSTEM_PROMPT_DEV_PLAN },
+            ...history,
+            userMessage,
+        ];
+        const planResult = await generateText({
+            model,
+            messages: planMessages,
+        } as Parameters<typeof generateText>[0]);
+        plan = (typeof planResult.text === "string" ? planResult.text.trim() : "") || "";
+        planSteps = plan.split("\n").filter((l) => /^\d+[\.\)]/.test(l.trim()));
+        console.info(`[orchestrator:dev] Plan (${planSteps.length} steps):\n${plan}`);
+    } catch (error) {
+        console.error(`[orchestrator:dev] Planning failed:`, error);
+    }
+
+    const totalSteps = planSteps.length || 1;
+    await progress(
+        `Plan ready (${totalSteps} step${totalSteps > 1 ? "s" : ""}):\n${planSteps.map((s) => s.trim()).join("\n") || "(executing directly)"}`,
+        { plan: planSteps, total_steps: totalSteps, status: "executing", current_action: "Starting execution..." },
+    );
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Execute with retry loop
+    // -----------------------------------------------------------------------
+    let finalText = "I attempted to work on your request but wasn't able to complete it.";
+    let toolResponse: StandardResponse | null = null;
+    let attempt = 0;
+    const filesCreated: string[] = [];
+
+    const executeMessages: ModelMessage[] = [
+        {
+            role: "system",
+            content: SYSTEM_PROMPT_DEV_EXECUTE + (plan ? `\n\nPLAN:\n${plan}` : ""),
+        },
+        ...history,
+        userMessage,
+    ];
+
+    while (attempt < MAX_DEV_ATTEMPTS) {
+        attempt++;
+        console.info(`[orchestrator:dev] Phase 2 — Execute attempt ${attempt}/${MAX_DEV_ATTEMPTS} for sender="${senderId}"`);
+        await progress(
+            `Executing (attempt ${attempt}/${MAX_DEV_ATTEMPTS})...`,
+            { current_step: attempt, current_action: `Executing (attempt ${attempt})` },
+        );
+
+        try {
+            const result = await runGenerate(executeMessages, 15);
+
+            if (result.text) finalText = result.text;
+            if (result.toolResponse) toolResponse = result.toolResponse;
+
+            const toolNames = extractToolNames(result.allToolResults);
+            const actionTools = toolNames.filter((n) => ["insert_code", "edit_file", "delete_code", "create_file"].includes(n));
+            if (actionTools.length > 0) {
+                const stepsCompleted = actionTools.map((t) => `Used ${t}`);
+                await progress(
+                    `Executed: ${actionTools.join(", ")}`,
+                    { steps_completed: stepsCompleted, current_action: `Completed: ${actionTools.join(", ")}` },
+                );
+            }
+
+            for (const tr of result.allToolResults) {
+                if (tr.toolName === "create_file") {
+                    const val = tr.result ?? tr.output;
+                    if (val && typeof val === "object" && "path" in (val as Record<string, unknown>)) {
+                        filesCreated.push(String((val as Record<string, unknown>).path));
+                    }
+                }
+            }
+
+            if (result.hasApproveButton) {
+                console.info(`[orchestrator:dev] Got Approve & Apply button on attempt ${attempt}.`);
+                await progress(
+                    "Changes ready for approval.",
+                    { status: "complete", current_action: "Awaiting approval", files_created: filesCreated, finished_at: Date.now() },
+                );
+                break;
+            }
+
+            // ---------------------------------------------------------------
+            // Phase 3: Evaluate — did the agent complete the task?
+            // ---------------------------------------------------------------
+            if (attempt < MAX_DEV_ATTEMPTS) {
+                console.info(`[orchestrator:dev] Phase 3 — Evaluating attempt ${attempt}`);
+                await progress("Evaluating progress...", { current_action: "Evaluating..." });
+
+                const toolSummary = summariseToolCalls(result.allToolResults);
+
+                try {
+                    const evalMessages: ModelMessage[] = [
+                        { role: "system", content: SYSTEM_PROMPT_DEV_EVALUATE },
+                        {
+                            role: "user",
+                            content:
+                                `User request: "${text}"\n\n` +
+                                `Agent's text response: "${finalText}"\n\n` +
+                                `Tool calls and results:\n${toolSummary || "(none)"}`,
+                        },
+                    ];
+                    const evalResult = await generateText({
+                        model,
+                        messages: evalMessages,
+                    } as Parameters<typeof generateText>[0]);
+                    const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
+                    console.info(`[orchestrator:dev] Evaluation verdict: ${verdict}`);
+
+                    if (verdict.startsWith("COMPLETE")) {
+                        await progress(
+                            "Task complete.",
+                            { status: "complete", current_action: "Done", files_created: filesCreated, finished_at: Date.now() },
+                        );
+                        break;
+                    }
+
+                    const nudge = verdict.startsWith("INCOMPLETE")
+                        ? verdict.replace(/^INCOMPLETE:\s*/, "")
+                        : verdict.startsWith("FAILED")
+                          ? `The previous attempt failed: ${verdict.replace(/^FAILED:\s*/, "")}. Try a different approach.`
+                          : "The task is not complete. Continue executing the plan.";
+
+                    await progress(`Retrying: ${nudge.slice(0, 120)}`, { errors: [nudge] });
+
+                    executeMessages.push(
+                        { role: "assistant", content: finalText || "(no text)" },
+                        { role: "user", content: `[SYSTEM] ${nudge}` },
+                    );
+                } catch (evalError) {
+                    console.error(`[orchestrator:dev] Evaluation failed:`, evalError);
+                    await progress("Evaluation failed, retrying...");
+                    executeMessages.push(
+                        { role: "assistant", content: finalText || "(no text)" },
+                        {
+                            role: "user",
+                            content: "[SYSTEM] The task is not complete. You stopped after reading or searching. You MUST call insert_code, edit_file, delete_code, or create_file to make the change. Continue.",
+                        },
+                    );
+                }
+            }
+        } catch (error) {
+            console.error(`[orchestrator:dev] Execute attempt ${attempt} failed:`, error);
+            const errMsg = error instanceof Error ? error.message : String(error);
+            if (attempt >= MAX_DEV_ATTEMPTS) {
+                finalText = "I ran into an error while working on your request. Please try again.";
+                await progress(
+                    `Failed after ${attempt} attempts: ${errMsg.slice(0, 120)}`,
+                    { status: "failed", errors: [errMsg], finished_at: Date.now() },
+                );
+            } else {
+                await progress(`Attempt ${attempt} errored, retrying...`, { errors: [errMsg] });
+                executeMessages.push(
+                    { role: "assistant", content: "(error occurred)" },
+                    { role: "user", content: "[SYSTEM] The previous attempt hit an error. Try again with a different approach." },
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Persist and return
+    // -----------------------------------------------------------------------
+    await clearActiveJob(senderId);
+    const assistantMessage: ModelMessage = { role: "assistant", content: finalText };
+    await saveChatMessages(senderId, [userMessage, assistantMessage]);
+
+    return { response: toolResponse ?? { text: finalText } };
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
 
 /**
  * Primary orchestration entry point for a single user message.
@@ -261,120 +609,11 @@ export async function processUserMessage(
     options?: ProcessUserMessageOptions,
 ): Promise<ProcessUserMessageResult> {
     const { senderId, text } = message;
-    const devMode = options?.devMode === true;
-
-    // -----------------------------------------------------------------------
-    // 1. Load existing chat history (best-effort; degrades gracefully).
-    // -----------------------------------------------------------------------
     const history: ModelMessage[] = await getChatHistory(senderId);
 
-    // Current user turn as a ModelMessage (Vercel AI SDK core format).
-    const userMessage: ModelMessage = {
-        role: "user",
-        content: text,
-    };
-
-    const systemContent = devMode ? SYSTEM_PROMPT_DEV : SYSTEM_PROMPT_NORMAL;
-    const systemMessage: ModelMessage = {
-        role: "system",
-        content: systemContent,
-    };
-
-    const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
-
-    // -----------------------------------------------------------------------
-    // 2. Call the LLM with tools enabled.
-    // -----------------------------------------------------------------------
-    let finalText = "I'm sorry, I wasn't able to generate a response.";
-    let toolResponse: StandardResponse | null = null;
-    const maxSteps = devMode ? 15 : 5;
-
-    try {
-        const result = await generateText({
-            model,
-            messages,
-            tools: aiTools,
-            maxSteps,
-        } as Parameters<typeof generateText>[0]);
-
-        // When the model returns empty text we still use tool output; only log a short summary.
-        if (typeof result.text !== "string" || result.text.trim().length === 0) {
-            const toolCount = Array.isArray(result.toolResults) ? result.toolResults.length : 0;
-            const stepsCount = Array.isArray((result as { steps?: unknown[] }).steps)
-                ? (result as { steps: unknown[] }).steps.length
-                : 0;
-            const firstToolName =
-                Array.isArray(result.toolResults) && result.toolResults.length > 0
-                    ? (result.toolResults[0] as { toolName?: string }).toolName ?? "?"
-                    : null;
-            console.info(
-                `[orchestrator] generateText returned no text; toolResults=${toolCount}, steps=${stepsCount}, firstTool=${firstToolName}`,
-            );
-        }
-
-        // The primary natural-language reply from the assistant.
-        if (typeof result.text === "string" && result.text.trim().length > 0) {
-            finalText = result.text.trim();
-        }
-
-        // Collect tool results from whatever shape the SDK returned. In AI SDK v6,
-        // tool results are exposed on `result.toolResults`, and each entry has an
-        // `output` field (for normal tools) or `result` (for some abstractions).
-        const allToolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }> = [];
-        if (Array.isArray(result.toolResults)) {
-            for (const tr of result.toolResults) {
-                const t = tr as { result?: unknown; output?: unknown; toolName?: string };
-                allToolResults.push(t);
-            }
-        }
-
-        // If any tool returned a StandardResponse (e.g. request_patch_approval), use it.
-        for (const toolResult of allToolResults) {
-            const value = toolResult.result ?? toolResult.output;
-            if (isStandardResponse(value)) {
-                toolResponse = value;
-                break;
-            }
-        }
-
-        // When the model left result.text empty but we have tool output, show it.
-        if (finalText === "I'm sorry, I wasn't able to generate a response." && allToolResults.length > 0) {
-            const last = allToolResults[allToolResults.length - 1];
-            const value = (last?.result ?? last?.output);
-            if (value !== undefined && value !== null) {
-                finalText = formatToolResultForUser(value, last.toolName);
-            }
-        }
-    } catch (error) {
-        console.error(
-            `[orchestrator] generateText failed for sender="${senderId}":`,
-            error,
-        );
-        finalText =
-            "I ran into an error while talking to the language model. " +
-            "Please try again in a moment.";
+    if (options?.devMode) {
+        return processDev(senderId, text, history, options.onProgress);
     }
-
-    // -----------------------------------------------------------------------
-    // 3. Persist user + assistant messages back to Redis.
-    // -----------------------------------------------------------------------
-    const assistantMessage: ModelMessage = {
-        role: "assistant",
-        content: finalText,
-    };
-
-    // Best-effort persistence; errors are logged inside saveChatMessages.
-    await saveChatMessages(senderId, [userMessage, assistantMessage]);
-
-    // -----------------------------------------------------------------------
-    // 4. Construct the StandardResponse for the adapter.
-    // -----------------------------------------------------------------------
-    const response: StandardResponse =
-        toolResponse ??
-        ({
-            text: finalText,
-        } satisfies StandardResponse);
-
-    return { response };
+    return processNormal(senderId, text, history);
 }
 
