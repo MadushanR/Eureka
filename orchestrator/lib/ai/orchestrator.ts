@@ -231,11 +231,21 @@ const SYSTEM_PROMPT_NORMAL =
 
 const SYSTEM_PROMPT_DEV =
     "You are a dev agent. The user asked you to implement or build something (a feature, fix, or change). " +
-    "Plan briefly, then use the available tools: search_local_codebase to find relevant code, read_file to read files, request_patch_approval to propose code changes (unified diff), run_tests to run the test suite, list_git_repos and get_uncommitted_changes as needed. " +
-    "When the user names a repo (e.g. 'Eureka'), use repo_name in tools that accept it. " +
-    "Critical: when the user asked to add or implement something, do NOT stop after read_file or search_local_codebase. You MUST call request_patch_approval with a valid unified diff so the user gets an 'Approve & Apply' button. One step (read/search) is not enough; always follow through with the patch. " +
-    "Work step by step. After making changes, run tests if applicable. " +
-    "End with a short summary: what you built or changed, and whether tests passed (or that you didn't run tests if not applicable).";
+    "You have these tools:\n" +
+    "- read_file: Read a file's contents (with line numbers). Always read the target file first.\n" +
+    "- insert_code: INSERT NEW CODE after a specific line number. Use this for adding new features, endpoints, functions, classes. Provide file_path, after_line (line number from read_file output), and new_code.\n" +
+    "- edit_file: MODIFY EXISTING CODE via search/replace. Use this for changing or fixing existing code. Provide file_path, search_string, replace_string.\n" +
+    "- search_local_codebase: Semantic code search to find relevant files.\n" +
+    "- run_tests: Run tests after changes.\n" +
+    "- list_git_repos, get_uncommitted_changes: Git helpers.\n" +
+    "When the user names a repo (e.g. 'Eureka'), use repo_name in tools that accept it.\n\n" +
+    "Critical rules:\n" +
+    "1. ALWAYS read the target file first with read_file so you can see line numbers.\n" +
+    "2. For ADDING new code (new endpoints, new functions, new features): use insert_code with after_line set to the line number after which to insert.\n" +
+    "3. For MODIFYING existing code: use edit_file with search_string and replace_string.\n" +
+    "4. Do NOT stop after read_file. You MUST follow through with insert_code or edit_file so the user gets an 'Approve & Apply' button.\n" +
+    "5. Do NOT write unified diffs yourself. The daemon generates them.\n" +
+    "Work step by step. End with a short summary of what you built or changed.";
 
 /**
  * Primary orchestration entry point for a single user message.

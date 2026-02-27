@@ -528,46 +528,76 @@ export const listFolderContents = tool({
  * Read the full text contents of a file within an allowed workspace.
  * Used by the dev agent to inspect source files before editing.
  */
+const READ_FILE_MAX_CHARS = 4000;
+
 export const readFile = tool({
     description:
-        "Read the full text contents of a file within an allowed workspace. Use when you need to see the current content of a file before editing or to understand code.",
+        "Read a file's contents with line numbers. Returns numbered lines (e.g. '42| code here'). " +
+        "Use start_line and end_line to read a specific range (1-based, inclusive). " +
+        "Large files are auto-truncated to ~4000 chars showing the first and last portions. " +
+        "IMPORTANT: After reading, note the line numbers — you'll need them for insert_code (after_line).",
     inputSchema: z.object({
         path: z
             .string()
             .min(1, "path must not be empty.")
-            .describe(
-                "Absolute path to a file within one of the allowed workspaces (e.g. path to a source file).",
-            ),
+            .describe("Absolute path to a file within an allowed workspace."),
+        start_line: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Optional 1-based start line."),
+        end_line: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Optional 1-based end line (inclusive)."),
     }),
-    async execute({ path }: { path: string }): Promise<unknown> {
+    async execute({
+        path,
+        start_line,
+        end_line,
+    }: {
+        path: string;
+        start_line?: number;
+        end_line?: number;
+    }): Promise<unknown> {
         const base = LOCAL_DAEMON_BASE();
         if (!base) {
             return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         }
         try {
+            const body: Record<string, unknown> = { path: path.trim() };
+            if (start_line != null) body.start_line = start_line;
+            if (end_line != null) body.end_line = end_line;
             const res = await fetch(`${base}/read-file`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ path: path.trim() }),
+                body: JSON.stringify(body),
             });
             const data = (await res.json().catch(() => ({}))) as {
                 success?: boolean;
                 path?: string;
                 content?: string;
+                total_lines?: number;
                 error?: string;
             };
             if (!res.ok) {
-                return {
-                    success: false,
-                    error: data.error ?? `Daemon returned ${res.status}`,
-                };
+                return { success: false, error: data.error ?? `Daemon returned ${res.status}` };
+            }
+            // Auto-truncate for the LLM context window
+            if (data.content && data.content.length > READ_FILE_MAX_CHARS) {
+                const head = data.content.slice(0, 2000);
+                const tail = data.content.slice(-2000);
+                data.content =
+                    head +
+                    `\n\n... [TRUNCATED — file has ${data.total_lines ?? "many"} lines, showing first and last ~50 lines. Use start_line/end_line to read a specific section] ...\n\n` +
+                    tail;
             }
             return data;
         } catch (e) {
-            return {
-                success: false,
-                error: e instanceof Error ? e.message : "Failed to reach the daemon.",
-            };
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
         }
     },
 });
@@ -639,35 +669,232 @@ export const runTests = tool({
 });
 
 /**
- * Tool: request_patch_approval
- * ----------------------------
- * When the model has prepared a *code* patch (unified diff) that will be applied
- * via git apply, it calls this tool to surface an approval UI. Use ONLY for
- * editing file contents (add/change/delete lines in code files). Do NOT use
- * for: deleting folders, deleting whole files, moving/renaming files, or any
- * other filesystem operation that is not a git patch.
+ * Tool: insert_code
+ * -----------------
+ * Add new code to a file by inserting after a specific line number.
+ * The LLM reads the file first (via read_file), picks a line number,
+ * and the daemon generates a perfect diff. Best for adding new features.
+ */
+export const insertCode = tool({
+    description:
+        "Insert new code into a file after a specific line number. Use this when ADDING new features, endpoints, functions, or classes. " +
+        "First call read_file to see the file contents with line numbers. Then call this tool with the line number to insert after and the new code. " +
+        "after_line is 1-based; set to 0 to prepend to the start of the file. " +
+        "The daemon generates a correct unified diff — you do NOT need to write any diff yourself.",
+    inputSchema: z.object({
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Optional repo name (e.g. 'Eureka'). Resolved to a workspace path."),
+        workspace_path: z
+            .string()
+            .optional()
+            .describe("Optional absolute path to the git repo root."),
+        file_path: z
+            .string()
+            .min(1, "file_path must not be empty.")
+            .describe("Path to the file relative to the repo root (e.g. 'rag-daemon/main.py')."),
+        after_line: z
+            .number()
+            .int()
+            .min(0)
+            .describe("1-based line number to insert after. 0 = prepend to start of file."),
+        new_code: z
+            .string()
+            .min(1, "new_code must not be empty.")
+            .describe("The new code to insert. Include all necessary indentation, decorators, imports, blank lines, etc."),
+    }),
+    async execute({
+        repo_name,
+        workspace_path,
+        file_path,
+        after_line,
+        new_code,
+    }: {
+        repo_name?: string;
+        workspace_path?: string;
+        file_path: string;
+        after_line: number;
+        new_code: string;
+    }): Promise<StandardResponse> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { text: "LOCAL_DAEMON_URL is not configured. Cannot prepare a patch." };
+        }
+        const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
+        let workspace = workspace_path?.trim();
+        if (!workspace && repo_name) {
+            workspace = (await resolveRepoName(repo_name)) ?? undefined;
+        }
+        if (!workspace) workspace = DEFAULT_WORKSPACE;
+        if (!workspace) {
+            return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
+        }
+
+        try {
+            const res = await fetch(`${base}/edit/insert-code`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path: workspace,
+                    file_path,
+                    after_line,
+                    new_code,
+                }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                message?: string;
+                patch?: string;
+            };
+            if (!res.ok || data.success === false) {
+                const err = data.message ?? `Daemon returned ${res.status}`;
+                return { text: `Patch computation failed: ${err}` };
+            }
+            const patch = data.patch ?? "";
+            if (!patch) {
+                return { text: "Daemon reported success but returned no patch." };
+            }
+
+            console.info("[tools.insert_code] Patch computed by daemon:\n", patch.slice(0, 2000));
+
+            const patchId = await stagePatch(patch, workspace);
+            const buttons: ReadonlyArray<InteractiveButton> = [
+                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+            ];
+            return {
+                text: "I've prepared new code to add. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
+                interactiveButtons: buttons,
+            };
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { text: `Failed to reach daemon for patch computation: ${msg}` };
+        }
+    },
+});
+
+/**
+ * Tool: edit_file
+ * ---------------
+ * Propose a code change using search/replace. The daemon generates the diff
+ * (via difflib.unified_diff) so the LLM never has to produce raw diff format.
+ * Surfaces an "Approve & Apply" button to the user.
+ */
+export const editFile = tool({
+    description:
+        "Edit a file by specifying an exact search string and its replacement. " +
+        "The daemon will compute a correct unified diff from the search/replace pair. " +
+        "Use this to add, change, or remove code. Do NOT write a unified diff yourself. " +
+        "Provide: file_path (relative to repo root), search_string (exact text currently in the file), and replace_string (what it should become). " +
+        "To add new code, use search_string to match the lines just BEFORE where the new code should go, and set replace_string to those same lines plus the new code appended. " +
+        "To delete code, set replace_string to empty string.",
+    inputSchema: z.object({
+        repo_name: z
+            .string()
+            .optional()
+            .describe("Optional human-friendly repo name (e.g. 'Eureka'). Resolved to a workspace path."),
+        workspace_path: z
+            .string()
+            .optional()
+            .describe("Optional absolute path to the git repo root. If omitted, uses repo_name or default."),
+        file_path: z
+            .string()
+            .min(1, "file_path must not be empty.")
+            .describe("Path to the file relative to the repo root (e.g. 'rag-daemon/main.py')."),
+        search_string: z
+            .string()
+            .min(1, "search_string must not be empty.")
+            .describe("Exact substring to find in the file. Must match the file content exactly (including whitespace and newlines)."),
+        replace_string: z
+            .string()
+            .describe("Replacement text. Can be empty to delete the matched text."),
+    }),
+    async execute({
+        repo_name,
+        workspace_path,
+        file_path,
+        search_string,
+        replace_string,
+    }: {
+        repo_name?: string;
+        workspace_path?: string;
+        file_path: string;
+        search_string: string;
+        replace_string: string;
+    }): Promise<StandardResponse> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { text: "LOCAL_DAEMON_URL is not configured. Cannot prepare a patch." };
+        }
+        const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
+        let workspace = workspace_path?.trim();
+        if (!workspace && repo_name) {
+            workspace = (await resolveRepoName(repo_name)) ?? undefined;
+        }
+        if (!workspace) workspace = DEFAULT_WORKSPACE;
+        if (!workspace) {
+            return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
+        }
+
+        try {
+            const res = await fetch(`${base}/edit/compute-replace-patch`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path: workspace,
+                    file_path,
+                    search_string,
+                    replace_string,
+                }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                message?: string;
+                patch?: string;
+            };
+            if (!res.ok || data.success === false) {
+                const err = data.message ?? `Daemon returned ${res.status}`;
+                return { text: `Patch computation failed: ${err}` };
+            }
+            const patch = data.patch ?? "";
+            if (!patch) {
+                return { text: "Daemon reported success but returned no patch." };
+            }
+
+            console.info("[tools.edit_file] Patch computed by daemon:\n", patch.slice(0, 2000));
+
+            const patchId = await stagePatch(patch, workspace);
+            const buttons: ReadonlyArray<InteractiveButton> = [
+                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+            ];
+            return {
+                text: "I've prepared a code change. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
+                interactiveButtons: buttons,
+            };
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { text: `Failed to reach daemon for patch computation: ${msg}` };
+        }
+    },
+});
+
+/**
+ * Tool: request_patch_approval (legacy)
+ * Kept for backward compatibility with existing staged patches. Prefer edit_file for new edits.
  */
 export const requestPatchApproval = tool({
     description:
-        "Ask the user to approve a generated *code* patch (unified diff) before it is applied with git. " +
-        "Use ONLY when you have produced a valid unified diff that edits file contents (e.g. add/change/remove lines in source files). " +
-        "Do NOT use for: deleting folders, deleting entire files, moving files, or any task that is not applying a code patch. " +
-        "For those tasks, reply in text that you cannot do them and suggest the user do it manually (e.g. delete the folder in File Explorer).",
+        "DEPRECATED — prefer edit_file instead. Only use this if you already have a precomputed valid unified diff. " +
+        "Ask the user to approve a raw unified diff patch before applying with git.",
     inputSchema: z.object({
         patch_string: z
             .string()
             .min(1, "Patch string must not be empty.")
-            .describe(
-                "Unified diff or patch representation of the proposed code changes (git apply format). " +
-                    "Only use when the change is a valid code patch, not for folder/file deletion or other filesystem operations.",
-            ),
+            .describe("A valid unified diff."),
         workspace_path: z
             .string()
             .optional()
-            .describe(
-                "Optional absolute path to the git repository root where the patch should be applied (e.g. C:\\Users\\you\\project). " +
-                    "If omitted, the default from the environment is used.",
-            ),
+            .describe("Absolute path to the git repo root."),
     }),
     async execute({
         patch_string,
@@ -1212,6 +1439,8 @@ export const systemLock = tool({
  */
 export const aiTools = {
     search_local_codebase: searchLocalCodebase,
+    insert_code: insertCode,
+    edit_file: editFile,
     request_patch_approval: requestPatchApproval,
     remove_line: removeLine,
     remove_lines_matching: removeLinesMatching,

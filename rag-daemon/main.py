@@ -91,6 +91,9 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 # These are set during the ``lifespan`` startup hook and used in route handlers.
+@app.get("/testing")
+async def testing():
+    return {"testing": True}
 _indexer: Optional[CodeIndexer] = None
 _chroma_collection: Optional[chromadb.Collection] = None
 _embed_model: Optional[SentenceTransformer] = None
@@ -256,6 +259,50 @@ class ComputeRemoveLinesMatchingPatchResponse(BaseModel):
     files_affected: int = 0
 
 
+class ComputeReplacePatchRequest(BaseModel):
+    """Payload for /edit/compute-replace-patch."""
+
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the git workspace root.")
+    file_path: str = Field(..., min_length=1, description="Path to file, relative to workspace root.")
+    search_string: str = Field(..., min_length=1, description="Exact substring to find in the file.")
+    replace_string: str = Field(..., description="Replacement text (can be empty to delete the match).")
+
+    @field_validator("workspace_path", "file_path")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Must not be blank.")
+        return v
+
+
+class ComputeReplacePatchResponse(BaseModel):
+    success: bool
+    message: str = ""
+    patch: str = ""
+
+
+class InsertCodeRequest(BaseModel):
+    """Payload for /edit/insert-code."""
+
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the git workspace root.")
+    file_path: str = Field(..., min_length=1, description="Path to file, relative to workspace root.")
+    after_line: int = Field(..., ge=0, description="1-based line number to insert after. 0 = prepend to start of file.")
+    new_code: str = Field(..., min_length=1, description="The new code to insert.")
+
+    @field_validator("workspace_path", "file_path")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Must not be blank.")
+        return v
+
+
+class InsertCodeResponse(BaseModel):
+    success: bool
+    message: str = ""
+    patch: str = ""
+
+
 class IndexNowResponse(BaseModel):
     message: str
 
@@ -319,6 +366,16 @@ class ReadFileRequest(BaseModel):
         min_length=1,
         description="Absolute path to a file within an allowed workspace.",
     )
+    start_line: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optional 1-based start line. If set, only lines from start_line are returned.",
+    )
+    end_line: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optional 1-based end line (inclusive). If set, only lines up to end_line are returned.",
+    )
 
 
 class ReadFileResponse(BaseModel):
@@ -327,6 +384,7 @@ class ReadFileResponse(BaseModel):
     success: bool
     path: str = ""
     content: str = ""
+    total_lines: int = 0
     error: str = ""
 
 
@@ -1334,8 +1392,9 @@ async def delete_path(request: DeletePathRequest) -> DeletePathResponse:
 )
 async def read_file(request: ReadFileRequest) -> ReadFileResponse:
     """
-    Return the text contents of a file. The path must be inside one of
-    ALLOWED_WORKSPACES. Returns error if the path is a directory or not readable as text.
+    Return the text contents of a file with line numbers.
+    Supports optional start_line/end_line for reading a range.
+    The path must be inside one of ALLOWED_WORKSPACES.
     """
     allowed, resolved = _is_path_within_allowed_workspaces(request.path.strip())
     if not allowed:
@@ -1348,14 +1407,24 @@ async def read_file(request: ReadFileRequest) -> ReadFileResponse:
         return ReadFileResponse(success=False, path=str(resolved), error="Path does not exist.")
     if not resolved.is_file():
         return ReadFileResponse(success=False, path=str(resolved), error="Path is not a file.")
-    content = _edit_read_text(resolved)
-    if content is None:
+    raw_content = _edit_read_text(resolved)
+    if raw_content is None:
         return ReadFileResponse(
             success=False,
             path=str(resolved),
             error="File could not be read as text (binary or unreadable).",
         )
-    return ReadFileResponse(success=True, path=str(resolved), content=content)
+    all_lines = raw_content.splitlines()
+    total = len(all_lines)
+    start = (request.start_line or 1) - 1
+    end = request.end_line or total
+    start = max(0, min(start, total))
+    end = max(start, min(end, total))
+    selected = all_lines[start:end]
+    # Prefix each line with its 1-based line number
+    numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(selected)]
+    content = "\n".join(numbered)
+    return ReadFileResponse(success=True, path=str(resolved), content=content, total_lines=total)
 
 
 def _run_command_sync(workspace_path: Path, command_line: str) -> tuple[bool, str, str, int]:
@@ -1758,6 +1827,133 @@ async def compute_remove_lines_matching_patch(
         patch=patch,
         files_affected=files_affected,
     )
+
+
+def _compute_replace_patch_sync(
+    workspace_path: str,
+    file_path: str,
+    search_string: str,
+    replace_string: str,
+) -> tuple[bool, str, str]:
+    """Exact search/replace → unified diff. Returns (success, message, patch)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(workspace_path)
+    if not allowed:
+        return False, "Workspace path is not in ALLOWED_WORKSPACES.", ""
+    try:
+        full_path = (resolved_workspace / file_path.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return False, "file_path is not inside the given workspace.", ""
+    if not full_path.is_file():
+        return False, f"File does not exist: {file_path}", ""
+    original = _edit_read_text(full_path)
+    if original is None:
+        return False, "File could not be read as text.", ""
+    if search_string not in original:
+        # Retry with trailing whitespace stripped from each line (LLMs often
+        # drop trailing spaces). Build a mapping so we can do the replacement
+        # on the original content.
+        def _strip_trailing(text: str) -> str:
+            return "\n".join(line.rstrip() for line in text.split("\n"))
+        stripped_original = _strip_trailing(original)
+        stripped_search = _strip_trailing(search_string)
+        if stripped_search not in stripped_original:
+            return False, "search_string not found in file. Make sure it matches exactly (including whitespace and newlines).", ""
+        # Found with stripped matching; do the replacement on the stripped version
+        # and rebuild the file.
+        stripped_replace = _strip_trailing(replace_string)
+        new_text_stripped = stripped_original.replace(stripped_search, stripped_replace, 1)
+        # Re-expand: since we only stripped trailing whitespace, using the stripped
+        # version as the new content is safe (trailing whitespace removal is benign).
+        original = stripped_original
+        new_text = new_text_stripped
+    else:
+        new_text = original.replace(search_string, replace_string, 1)
+    if new_text == original:
+        return False, "Replacement produced no change.", ""
+    rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
+    patch = _build_unified_diff(rel_path_str, original, new_text)
+    if not patch:
+        return False, "Diff was empty after replacement.", ""
+    return True, "Patch computed successfully.", patch
+
+
+@app.post(
+    "/edit/compute-replace-patch",
+    response_model=ComputeReplacePatchResponse,
+    tags=["Edit"],
+    summary="Compute a unified diff from an exact search/replace in a file",
+)
+async def compute_replace_patch(
+    request: ComputeReplacePatchRequest,
+) -> ComputeReplacePatchResponse:
+    """
+    Read the target file, find search_string, replace with replace_string,
+    and return a unified diff suitable for git apply. Does NOT write to disk.
+    """
+    success, message, patch = await asyncio.to_thread(
+        _compute_replace_patch_sync,
+        request.workspace_path,
+        request.file_path,
+        request.search_string,
+        request.replace_string,
+    )
+    return ComputeReplacePatchResponse(success=success, message=message, patch=patch)
+
+
+def _insert_code_sync(
+    workspace_path: str,
+    file_path: str,
+    after_line: int,
+    new_code: str,
+) -> tuple[bool, str, str]:
+    """Insert new_code after after_line (1-based, 0=prepend). Returns (success, message, patch)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(workspace_path)
+    if not allowed:
+        return False, "Workspace path is not in ALLOWED_WORKSPACES.", ""
+    try:
+        full_path = (resolved_workspace / file_path.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return False, "file_path is not inside the given workspace.", ""
+    if not full_path.is_file():
+        return False, f"File does not exist: {file_path}", ""
+    original = _edit_read_text(full_path)
+    if original is None:
+        return False, "File could not be read as text.", ""
+    lines = original.splitlines(keepends=True)
+    if after_line < 0 or after_line > len(lines):
+        return False, f"after_line {after_line} is out of range (file has {len(lines)} lines).", ""
+    # Ensure new_code ends with a newline so it becomes a proper line
+    code_to_insert = new_code if new_code.endswith("\n") else new_code + "\n"
+    new_lines = lines[:after_line] + [code_to_insert] + lines[after_line:]
+    new_text = "".join(new_lines)
+    rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
+    patch = _build_unified_diff(rel_path_str, original, new_text)
+    if not patch:
+        return False, "Diff was empty after insertion.", ""
+    return True, "Patch computed successfully.", patch
+
+
+@app.post(
+    "/edit/insert-code",
+    response_model=InsertCodeResponse,
+    tags=["Edit"],
+    summary="Compute a unified diff that inserts new code after a given line number",
+)
+async def insert_code(request: InsertCodeRequest) -> InsertCodeResponse:
+    """
+    Insert new_code after the given line number (1-based; 0 = prepend).
+    Returns a unified diff suitable for git apply. Does NOT write to disk.
+    """
+    success, message, patch = await asyncio.to_thread(
+        _insert_code_sync,
+        request.workspace_path,
+        request.file_path,
+        request.after_line,
+        request.new_code,
+    )
+    return InsertCodeResponse(success=success, message=message, patch=patch)
 
 
 @app.post(
