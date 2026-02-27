@@ -69,6 +69,27 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
         return lines.join("\n");
     }
 
+    // read_file: { success, path, content, error } — check before generic success
+    if (typeof obj.content === "string" && obj.success === true) {
+        const path = typeof obj.path === "string" ? obj.path : "file";
+        const preview = (obj.content as string).slice(0, 300);
+        return `Read ${path} (${(obj.content as string).length} chars):\n${preview}${(obj.content as string).length > 300 ? "…" : ""}`;
+    }
+    if (obj.success === false && typeof obj.path === "string" && typeof obj.error === "string") {
+        return `Read file failed (${obj.path}): ${obj.error}`;
+    }
+
+    // run_tests: { success, stdout, stderr, exit_code, error } — check before generic success
+    if (typeof obj.exit_code === "number" && (typeof obj.stdout === "string" || typeof obj.stderr === "string")) {
+        const code = obj.exit_code;
+        const out = typeof obj.stdout === "string" ? obj.stdout.trim().slice(0, 500) : "";
+        const err = typeof obj.stderr === "string" ? obj.stderr.trim().slice(0, 500) : "";
+        const parts = [`Tests exited with code ${code}.`];
+        if (out) parts.push("Stdout:\n" + out);
+        if (err) parts.push("Stderr:\n" + err);
+        return parts.join("\n");
+    }
+
     // delete_path / Spotify: { success, message } or { success: false, error }
     if (typeof obj.success === "boolean") {
         if (obj.success && typeof obj.message === "string") {
@@ -164,6 +185,31 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Dev feature request detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Heuristic: treat the message as a "dev feature" request when the user asks
+ * to build, implement, or add something (e.g. "build auth for Eureka").
+ * Used to trigger a two-phase reply: immediate "working on it" then a summary.
+ */
+export function isDevFeatureRequest(text: string): boolean {
+    const t = text.trim().toLowerCase();
+    const triggers = [
+        "build ",
+        "implement ",
+        "add feature",
+        "add a feature",
+        "create a ",
+        "create ",
+        "add ",
+        "implementing ",
+        "building ",
+    ];
+    return triggers.some((phrase) => t.includes(phrase));
+}
+
+// ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
 
@@ -171,16 +217,39 @@ interface ProcessUserMessageResult {
     response: StandardResponse;
 }
 
+export interface ProcessUserMessageOptions {
+    /** Use dev-agent prompt and more steps (plan, edit, test, summarize). */
+    devMode?: boolean;
+}
+
+const SYSTEM_PROMPT_NORMAL =
+    "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
+    "Use the available tools based on their descriptions; do not follow fixed recipes. " +
+    "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, or remove_lines_matching) so they can resolve the path themselves. " +
+    "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
+    "Always finish with a concise reply that explains what you did or found.";
+
+const SYSTEM_PROMPT_DEV =
+    "You are a dev agent. The user asked you to implement or build something (a feature, fix, or change). " +
+    "Plan briefly, then use the available tools: search_local_codebase to find relevant code, read_file to read files, request_patch_approval to propose code changes (unified diff), run_tests to run the test suite, list_git_repos and get_uncommitted_changes as needed. " +
+    "When the user names a repo (e.g. 'Eureka'), use repo_name in tools that accept it. " +
+    "Critical: when the user asked to add or implement something, do NOT stop after read_file or search_local_codebase. You MUST call request_patch_approval with a valid unified diff so the user gets an 'Approve & Apply' button. One step (read/search) is not enough; always follow through with the patch. " +
+    "Work step by step. After making changes, run tests if applicable. " +
+    "End with a short summary: what you built or changed, and whether tests passed (or that you didn't run tests if not applicable).";
+
 /**
  * Primary orchestration entry point for a single user message.
  *
  * @param message - Platform-agnostic inbound message.
+ * @param options - Optional: devMode for multi-step dev-agent flow.
  * @returns An object containing the final `StandardResponse` to send.
  */
 export async function processUserMessage(
     message: StandardMessage,
+    options?: ProcessUserMessageOptions,
 ): Promise<ProcessUserMessageResult> {
     const { senderId, text } = message;
+    const devMode = options?.devMode === true;
 
     // -----------------------------------------------------------------------
     // 1. Load existing chat history (best-effort; degrades gracefully).
@@ -193,15 +262,10 @@ export async function processUserMessage(
         content: text,
     };
 
-    // Prepend system instruction. Keep it short; tool descriptions define when to use each tool.
+    const systemContent = devMode ? SYSTEM_PROMPT_DEV : SYSTEM_PROMPT_NORMAL;
     const systemMessage: ModelMessage = {
         role: "system",
-        content:
-            "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
-            "Use the available tools based on their descriptions; do not follow fixed recipes. " +
-            "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, or remove_lines_matching) so they can resolve the path themselves. " +
-            "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
-            "Always finish with a concise reply that explains what you did or found.",
+        content: systemContent,
     };
 
     const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
@@ -211,14 +275,15 @@ export async function processUserMessage(
     // -----------------------------------------------------------------------
     let finalText = "I'm sorry, I wasn't able to generate a response.";
     let toolResponse: StandardResponse | null = null;
+    const maxSteps = devMode ? 15 : 5;
 
     try {
         const result = await generateText({
             model,
             messages,
             tools: aiTools,
-            maxSteps: 5,
-        });
+            maxSteps,
+        } as Parameters<typeof generateText>[0]);
 
         // When the model returns empty text we still use tool output; only log a short summary.
         if (typeof result.text !== "string" || result.text.trim().length === 0) {

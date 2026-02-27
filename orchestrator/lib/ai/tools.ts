@@ -523,6 +523,122 @@ export const listFolderContents = tool({
 });
 
 /**
+ * Tool: read_file
+ * ---------------
+ * Read the full text contents of a file within an allowed workspace.
+ * Used by the dev agent to inspect source files before editing.
+ */
+export const readFile = tool({
+    description:
+        "Read the full text contents of a file within an allowed workspace. Use when you need to see the current content of a file before editing or to understand code.",
+    inputSchema: z.object({
+        path: z
+            .string()
+            .min(1, "path must not be empty.")
+            .describe(
+                "Absolute path to a file within one of the allowed workspaces (e.g. path to a source file).",
+            ),
+    }),
+    async execute({ path }: { path: string }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        try {
+            const res = await fetch(`${base}/read-file`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ path: path.trim() }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                path?: string;
+                content?: string;
+                error?: string;
+            };
+            if (!res.ok) {
+                return {
+                    success: false,
+                    error: data.error ?? `Daemon returned ${res.status}`,
+                };
+            }
+            return data;
+        } catch (e) {
+            return {
+                success: false,
+                error: e instanceof Error ? e.message : "Failed to reach the daemon.",
+            };
+        }
+    },
+});
+
+/**
+ * Tool: run_tests
+ * ---------------
+ * Run the test suite in a workspace (e.g. npm test, pytest). Only whitelisted
+ * commands are allowed. Use after making code changes to verify nothing broke.
+ */
+export const runTests = tool({
+    description:
+        "Run the test suite in a given workspace (e.g. npm test or pytest). Use after editing code to verify tests pass. Only whitelisted commands are allowed: npm test, npm run test, yarn test, pnpm test, pytest, python -m pytest, dotnet test.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .min(1, "workspace_path must not be empty.")
+            .describe(
+                "Absolute path to the workspace (repo root) where tests should run.",
+            ),
+        command_line: z
+            .string()
+            .min(1, "command_line must not be empty.")
+            .describe(
+                "Command to run, e.g. 'npm test' or 'pytest'. Must be one of: npm test, npm run test, yarn test, pnpm test, pnpm run test, pytest, python -m pytest, dotnet test.",
+            ),
+    }),
+    async execute({
+        workspace_path,
+        command_line,
+    }: {
+        workspace_path: string;
+        command_line: string;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        try {
+            const res = await fetch(`${base}/run-command`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path: workspace_path.trim(),
+                    command_line: command_line.trim(),
+                }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                stdout?: string;
+                stderr?: string;
+                exit_code?: number;
+                error?: string;
+            };
+            if (!res.ok) {
+                return {
+                    success: false,
+                    error: data.error ?? `Daemon returned ${res.status}`,
+                };
+            }
+            return data;
+        } catch (e) {
+            return {
+                success: false,
+                error: e instanceof Error ? e.message : "Failed to reach the daemon.",
+            };
+        }
+    },
+});
+
+/**
  * Tool: request_patch_approval
  * ----------------------------
  * When the model has prepared a *code* patch (unified diff) that will be applied
@@ -1105,6 +1221,8 @@ export const aiTools = {
     get_uncommitted_changes: getUncommittedChanges,
     list_workspace_folders: listWorkspaceFolders,
     list_folder_contents: listFolderContents,
+    read_file: readFile,
+    run_tests: runTests,
     delete_path: deletePath,
     spotify_play: spotifyPlay,
     spotify_pause: spotifyPause,

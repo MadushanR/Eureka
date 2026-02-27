@@ -39,6 +39,7 @@ import asyncio
 import difflib
 import fnmatch
 import logging
+import re
 import os
 import platform
 import shutil
@@ -308,6 +309,64 @@ class DeletePathResponse(BaseModel):
 
     success: bool
     message: str
+
+
+class ReadFileRequest(BaseModel):
+    """Payload for the /read-file endpoint."""
+
+    path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute path to a file within an allowed workspace.",
+    )
+
+
+class ReadFileResponse(BaseModel):
+    """Response model for /read-file endpoint."""
+
+    success: bool
+    path: str = ""
+    content: str = ""
+    error: str = ""
+
+
+# Allowed command lines for /run-command (normalized to single spaces, lowercased for comparison).
+# Only these exact commands are permitted to avoid shell injection.
+RUN_COMMAND_WHITELIST = frozenset({
+    "npm test",
+    "npm run test",
+    "yarn test",
+    "pnpm test",
+    "pnpm run test",
+    "pytest",
+    "python -m pytest",
+    "dotnet test",
+})
+
+
+class RunCommandRequest(BaseModel):
+    """Payload for the /run-command endpoint."""
+
+    workspace_path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute path to the workspace (must be in ALLOWED_WORKSPACES).",
+    )
+    command_line: str = Field(
+        ...,
+        min_length=1,
+        description="Command to run, e.g. 'npm test' or 'pytest'. Must match whitelist.",
+    )
+
+
+class RunCommandResponse(BaseModel):
+    """Response model for /run-command endpoint."""
+
+    success: bool
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = -1
+    error: str = ""
 
 
 class SpotifyGenericResponse(BaseModel):
@@ -955,18 +1014,21 @@ def _edit_read_text(path: Path) -> Optional[str]:
     return None
 
 
-def _build_unified_diff(rel_path_str: str, old_lines: List[str], new_lines: List[str]) -> str:
-    """Build a git-style unified diff for one file. rel_path_str uses forward slashes.
-    Input lines may have trailing newlines; we strip them for difflib (which expects no newlines).
+def _build_unified_diff(rel_path_str: str, old_text: str, new_text: str) -> str:
+    """Build a git-style unified diff for one file.
+
+    ``rel_path_str`` is the path *relative to the git repo root* using forward
+    slashes (e.g. ``rag-daemon/config.py``). ``old_text`` and ``new_text`` are
+    the full file contents *before* and *after* the edit.
     """
     fromfile = "a/" + rel_path_str.replace("\\", "/")
     tofile = "b/" + rel_path_str.replace("\\", "/")
-    a = [ln.rstrip("\n") for ln in old_lines]
-    b = [ln.rstrip("\n") for ln in new_lines]
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
     diff_lines = list(
         difflib.unified_diff(
-            a,
-            b,
+            old_lines,
+            new_lines,
             fromfile=fromfile,
             tofile=tofile,
             fromfiledate="",
@@ -1001,10 +1063,6 @@ def _compute_remove_line_patch_sync(
     if content is None:
         return False, "Could not read file as text.", ""
     lines = content.splitlines(keepends=True)
-    if not lines and not content.endswith("\n"):
-        lines = [content] if content else []
-    elif content and not content.endswith("\n") and lines:
-        lines[-1] = lines[-1] + "\n"
     n = len(lines)
     start = line_number - 1
     end = (line_end if line_end is not None else line_number) - 1
@@ -1012,7 +1070,8 @@ def _compute_remove_line_patch_sync(
         return False, f"Line number(s) out of range (file has {n} lines).", ""
     new_lines = lines[:start] + lines[end + 1 :]
     rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
-    patch = _build_unified_diff(rel_path_str, lines, new_lines)
+    new_text = "".join(new_lines)
+    patch = _build_unified_diff(rel_path_str, content, new_text)
     return True, "", patch
 
 
@@ -1041,15 +1100,12 @@ def _compute_remove_lines_matching_patch_sync(
         if content is None:
             return False, "Could not read file as text.", "", 0
         lines = content.splitlines(keepends=True)
-        if not lines and not content.endswith("\n"):
-            lines = [content] if content else []
-        elif content and not content.endswith("\n") and lines:
-            lines[-1] = lines[-1] + "\n"
         new_lines = [line for line in lines if pattern not in line]
         if len(new_lines) == len(lines):
             return True, "", "", 0
         rel_path_str = str(full_path.relative_to(resolved_workspace)).replace("\\", "/")
-        patch = _build_unified_diff(rel_path_str, lines, new_lines)
+        new_text = "".join(new_lines)
+        patch = _build_unified_diff(rel_path_str, content, new_text)
         return True, "", patch, 1
 
     for path in resolved_workspace.rglob("*"):
@@ -1067,15 +1123,12 @@ def _compute_remove_lines_matching_patch_sync(
         if content is None:
             continue
         lines = content.splitlines(keepends=True)
-        if not lines and not content.endswith("\n"):
-            lines = [content] if content else []
-        elif content and not content.endswith("\n") and lines:
-            lines[-1] = lines[-1] + "\n"
         new_lines = [line for line in lines if pattern not in line]
         if len(new_lines) == len(lines):
             continue
         rel_path_str = str(rel).replace("\\", "/")
-        patch = _build_unified_diff(rel_path_str, lines, new_lines)
+        new_text = "".join(new_lines)
+        patch = _build_unified_diff(rel_path_str, content, new_text)
         patches.append(patch)
         files_affected += 1
 
@@ -1101,6 +1154,12 @@ async def health() -> Dict[str, Any]:
         "indexed_chunks": indexed_count,
         "embedding_model": settings.embedding_model,
     }
+
+
+@app.get("/ping", tags=["System"])
+async def ping() -> Dict[str, str]:
+    """Simple liveness ping. Returns {"status": "ok"}."""
+    return {"status": "ok"}
 
 
 @app.get(
@@ -1265,6 +1324,91 @@ async def delete_path(request: DeletePathRequest) -> DeletePathResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete: {exc!s}",
         ) from exc
+
+
+@app.post(
+    "/read-file",
+    response_model=ReadFileResponse,
+    tags=["System"],
+    summary="Read a file's contents within an allowed workspace",
+)
+async def read_file(request: ReadFileRequest) -> ReadFileResponse:
+    """
+    Return the text contents of a file. The path must be inside one of
+    ALLOWED_WORKSPACES. Returns error if the path is a directory or not readable as text.
+    """
+    allowed, resolved = _is_path_within_allowed_workspaces(request.path.strip())
+    if not allowed:
+        return ReadFileResponse(
+            success=False,
+            path=request.path,
+            error="Requested path is not within any allowed workspace.",
+        )
+    if not resolved.exists():
+        return ReadFileResponse(success=False, path=str(resolved), error="Path does not exist.")
+    if not resolved.is_file():
+        return ReadFileResponse(success=False, path=str(resolved), error="Path is not a file.")
+    content = _edit_read_text(resolved)
+    if content is None:
+        return ReadFileResponse(
+            success=False,
+            path=str(resolved),
+            error="File could not be read as text (binary or unreadable).",
+        )
+    return ReadFileResponse(success=True, path=str(resolved), content=content)
+
+
+def _run_command_sync(workspace_path: Path, command_line: str) -> tuple[bool, str, str, int]:
+    """Run a whitelisted command in the given directory. Returns (success, stdout, stderr, exit_code)."""
+    normalized = " ".join(command_line.strip().lower().split())
+    if normalized not in RUN_COMMAND_WHITELIST:
+        return False, "", f"Command not in whitelist. Allowed: {sorted(RUN_COMMAND_WHITELIST)}", -1
+    try:
+        result = subprocess.run(
+            command_line.strip().split(),
+            cwd=workspace_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return True, result.stdout or "", result.stderr or "", result.returncode
+    except subprocess.TimeoutExpired:
+        return False, "", "Command timed out (120s).", -1
+    except Exception as e:
+        return False, "", str(e), -1
+
+
+@app.post(
+    "/run-command",
+    response_model=RunCommandResponse,
+    tags=["System"],
+    summary="Run a whitelisted command (e.g. tests) in a workspace",
+)
+async def run_command(request: RunCommandRequest) -> RunCommandResponse:
+    """
+    Run a whitelisted command in the given workspace. Only test-related commands
+    are allowed (e.g. npm test, pytest). Used by the dev agent to run tests.
+    """
+    allowed, resolved = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return RunCommandResponse(
+            success=False,
+            error="Workspace path is not within any allowed workspace.",
+        )
+    if not resolved.exists() or not resolved.is_dir():
+        return RunCommandResponse(success=False, error="Workspace path does not exist or is not a directory.")
+    ok, stdout, stderr, exit_code = await asyncio.to_thread(
+        _run_command_sync,
+        resolved,
+        request.command_line.strip(),
+    )
+    return RunCommandResponse(
+        success=ok,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        error="" if ok else (stderr or "Command failed."),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1734,7 +1878,16 @@ async def apply_patch(request: ApplyPatchRequest) -> ApplyPatchResponse:
             ),
         )
 
-    patch_bytes = request.patch_string.encode("utf-8")
+    # Normalize and validate patch (strip markdown, require unified diff, trailing newline)
+    normalized, norm_error = _normalize_patch_string(request.patch_string)
+    if norm_error:
+        logger.warning("/apply-patch validation failed: %s", norm_error)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=norm_error,
+        )
+
+    patch_bytes = normalized.encode("utf-8")
 
     # ------------------------------------------------------------------ #
     # Stage 1: Dry-run (--check)                                          #
@@ -1968,6 +2121,41 @@ async def spotify_close() -> SpotifyGenericResponse:
 
 
 # ---------------------------------------------------------------------------
+# Patch string normalization (LLM often wraps in markdown or sends invalid input)
+# ---------------------------------------------------------------------------
+
+def _normalize_patch_string(raw: str) -> tuple[str, Optional[str]]:
+    """
+    Normalize and validate a patch string before passing to git apply.
+
+    - Strips leading/trailing whitespace.
+    - If wrapped in ```diff ... ``` or ``` ... ```, extracts the inner content.
+    - Ensures the result starts with "--- " (unified diff header) and ends with newline.
+    Returns (normalized_string, None) on success, or ("", error_message) on failure.
+    """
+    s = raw.strip()
+    if not s:
+        return "", "Patch string is empty after trimming."
+    # Unwrap markdown code blocks if present
+    code_block = re.compile(r"^```(?:diff)?\s*\n(.*?)\n```\s*$", re.DOTALL)
+    m = code_block.match(s)
+    if m:
+        s = m.group(1).strip()
+    if not s:
+        return "", "Patch string is empty after removing markdown fence."
+    # Require unified diff format (starts with --- )
+    if not s.startswith("--- "):
+        preview = s[:80].replace("\n", " ")
+        return "", (
+            "Patch does not look like a unified diff (must start with '--- a/path'). "
+            f"Got: {preview!r}…"
+        )
+    if not s.endswith("\n"):
+        s = s + "\n"
+    return s, None
+
+
+# ---------------------------------------------------------------------------
 # Subprocess helper  (kept synchronous — called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
@@ -1999,8 +2187,9 @@ def _run_git_apply(
     cmd: List[str] = ["git", "apply"]
     if dry_run:
         cmd.append("--check")
-    # Always pass --whitespace=fix to avoid spurious failures from trailing
-    # whitespace differences common in AI-generated patches.
+    # Ignore whitespace/line-ending differences so LF patches apply on CRLF files (Windows).
+    cmd.append("--ignore-whitespace")
+    # Fix trailing whitespace etc. in applied hunks.
     cmd.append("--whitespace=fix")
     # Read patch from stdin.
     cmd.append("-")

@@ -38,7 +38,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { TelegramAdapter, type TelegramUpdate } from "@/lib/adapters/TelegramAdapter";
 import type { StandardMessage } from "@/types/messaging";
-import { processUserMessage } from "@/lib/ai/orchestrator";
+import { processUserMessage, isDevFeatureRequest } from "@/lib/ai/orchestrator";
 import { buildPushCompletionUrl } from "@/lib/pushCallback";
 import { getPendingPatch, getPendingPush, getPendingPushOnly } from "@/lib/redis";
 
@@ -494,6 +494,18 @@ async function processMessage(message: StandardMessage): Promise<void> {
         // Handle "Approve & Push" button: commit and push via daemon, then done.
         if (await handlePushAction(message)) {
             console.info(`[telegram/webhook] Push action handled for sender=${message.senderId}.`);
+            return;
+        }
+
+        // Dev feature requests: send "working on it" first, then run dev-agent and send summary.
+        if (isDevFeatureRequest(message.text)) {
+            await getAdapter().sendResponse(
+                { text: "I'm working on it. I'll message you when I have an update." },
+                message.senderId
+            );
+            const { response } = await processUserMessage(message, { devMode: true });
+            await getAdapter().sendResponse(response, message.senderId);
+            console.info(`[telegram/webhook] Dev flow completed; summary sent to sender=${message.senderId}.`);
             return;
         }
 

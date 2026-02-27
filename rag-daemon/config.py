@@ -1,4 +1,3 @@
-#testing
 """
 config.py — Daemon Configuration
 =================================
