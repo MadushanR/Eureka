@@ -57,6 +57,7 @@ from chromadb import Settings as ChromaSettings
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 import requests
@@ -98,6 +99,80 @@ app = FastAPI(
 _indexer: Optional[CodeIndexer] = None
 _chroma_collection: Optional[chromadb.Collection] = None
 _embed_model: Optional[SentenceTransformer] = None
+
+# BM25 sparse index — rebuilt periodically from ChromaDB contents.
+_bm25_index: Optional[BM25Okapi] = None
+_bm25_corpus_ids: List[str] = []
+_bm25_corpus_docs: List[str] = []
+_bm25_corpus_metas: List[Dict] = []
+_bm25_last_built: float = 0.0
+_BM25_REBUILD_INTERVAL_S: float = 300.0  # 5 minutes
+
+
+def _tokenize_for_bm25(text: str) -> List[str]:
+    """Simple whitespace + punctuation tokenizer suitable for BM25 over code."""
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+", text.lower())
+
+
+def _rebuild_bm25_index() -> None:
+    """
+    Pull every document out of the ChromaDB collection and build a fresh
+    BM25Okapi index.  Called at most once per ``_BM25_REBUILD_INTERVAL_S``.
+    """
+    global _bm25_index, _bm25_corpus_ids, _bm25_corpus_docs, _bm25_corpus_metas, _bm25_last_built
+
+    if _chroma_collection is None:
+        return
+
+    total = _chroma_collection.count()
+    if total == 0:
+        _bm25_index = None
+        _bm25_corpus_ids = []
+        _bm25_corpus_docs = []
+        _bm25_corpus_metas = []
+        _bm25_last_built = time.time()
+        return
+
+    all_data = _chroma_collection.get(
+        include=["documents", "metadatas"],
+        limit=total,
+    )
+    ids: List[str] = all_data.get("ids", [])
+    docs: List[str] = all_data.get("documents", [])
+    metas: List[Dict] = all_data.get("metadatas", [])
+
+    tokenized = [_tokenize_for_bm25(doc) for doc in docs]
+
+    _bm25_index = BM25Okapi(tokenized)
+    _bm25_corpus_ids = ids
+    _bm25_corpus_docs = docs
+    _bm25_corpus_metas = metas
+    _bm25_last_built = time.time()
+    logger.info("BM25 index rebuilt — %d documents", len(ids))
+
+
+def _ensure_bm25_fresh() -> None:
+    """Rebuild the BM25 index if it's stale or was never built."""
+    if _bm25_index is None or (time.time() - _bm25_last_built > _BM25_REBUILD_INTERVAL_S):
+        _rebuild_bm25_index()
+
+
+def _reciprocal_rank_fusion(
+    ranked_lists: List[List[str]],
+    k: int = 60,
+) -> List[str]:
+    """
+    Combine multiple ranked ID lists using Reciprocal Rank Fusion (RRF).
+
+    For each document across all lists, its fused score is the sum of
+    ``1 / (k + rank)`` where ``rank`` is the 1-based position in each list.
+    Higher fused scores indicate stronger agreement among retrievers.
+    """
+    scores: Dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank_pos, doc_id in enumerate(ranked, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank_pos)
+    return sorted(scores, key=scores.get, reverse=True)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -2699,15 +2774,19 @@ async def delete_block(request: DeleteBlockRequest) -> DeleteBlockResponse:
     "/search",
     response_model=SearchResponse,
     tags=["RAG"],
-    summary="Semantic code search",
+    summary="Hybrid code search (dense + BM25 with RRF)",
 )
 async def search(request: SearchRequest) -> SearchResponse:
     """
-    Embed *query* using the local model and perform a nearest-neighbour search
-    against the ChromaDB collection.
+    **Hybrid search** — runs two retrievers in parallel and fuses results with
+    Reciprocal Rank Fusion (RRF):
 
-    Returns the *top_k* most semantically similar code chunks together with
-    their source file paths and line numbers.
+    1. **Dense retriever** — ChromaDB cosine-similarity over sentence-transformer
+       embeddings (semantic understanding).
+    2. **Sparse retriever** — BM25Okapi over tokenised code chunks (exact
+       keyword / identifier matching).
+
+    The fused ranking is used to select the final *top_k* results.
     """
     if _embed_model is None or _chroma_collection is None:
         raise HTTPException(
@@ -2715,7 +2794,9 @@ async def search(request: SearchRequest) -> SearchResponse:
             detail="Daemon is still initialising.  Please retry shortly.",
         )
 
-    # Embed the query in a background thread to avoid blocking the event loop.
+    # ---- 1. Dense retrieval (ChromaDB) ------------------------------------
+    DENSE_FETCH = max(request.top_k * 4, 20)
+
     query_embedding: List[float] = await asyncio.to_thread(
         lambda: _embed_model.encode(
             request.query,
@@ -2724,32 +2805,71 @@ async def search(request: SearchRequest) -> SearchResponse:
         ).tolist()
     )
 
-    # Query ChromaDB.  ``include`` controls which fields are returned.
     raw = _chroma_collection.query(
         query_embeddings=[query_embedding],
-        n_results=request.top_k,
+        n_results=DENSE_FETCH,
         include=["distances", "documents", "metadatas"],
     )
 
-    # ChromaDB wraps results in a list-of-lists (one inner list per query).
-    ids: List[str] = raw.get("ids", [[]])[0]
-    distances: List[float] = raw.get("distances", [[]])[0]
-    documents: List[str] = raw.get("documents", [[]])[0]
-    metadatas: List[Dict] = raw.get("metadatas", [[]])[0]
+    dense_ids: List[str] = raw.get("ids", [[]])[0]
+    dense_distances: List[float] = raw.get("distances", [[]])[0]
+    dense_docs: List[str] = raw.get("documents", [[]])[0]
+    dense_metas: List[Dict] = raw.get("metadatas", [[]])[0]
+
+    # Build a lookup table so we can reconstruct metadata after fusion.
+    doc_lookup: Dict[str, Dict[str, Any]] = {}
+    for cid, dist, doc, meta in zip(dense_ids, dense_distances, dense_docs, dense_metas):
+        doc_lookup[cid] = {
+            "distance": dist,
+            "text": doc,
+            "meta": meta,
+        }
+
+    # ---- 2. Sparse retrieval (BM25) --------------------------------------
+    await asyncio.to_thread(_ensure_bm25_fresh)
+
+    sparse_ids: List[str] = []
+    if _bm25_index is not None and _bm25_corpus_ids:
+        query_tokens = _tokenize_for_bm25(request.query)
+        bm25_scores = await asyncio.to_thread(
+            _bm25_index.get_scores, query_tokens,
+        )
+        SPARSE_FETCH = max(request.top_k * 4, 20)
+        top_sparse_indices = sorted(
+            range(len(bm25_scores)),
+            key=lambda i: bm25_scores[i],
+            reverse=True,
+        )[:SPARSE_FETCH]
+
+        for idx in top_sparse_indices:
+            cid = _bm25_corpus_ids[idx]
+            sparse_ids.append(cid)
+            if cid not in doc_lookup:
+                doc_lookup[cid] = {
+                    "distance": None,
+                    "text": _bm25_corpus_docs[idx],
+                    "meta": _bm25_corpus_metas[idx],
+                }
+
+    # ---- 3. Reciprocal Rank Fusion ----------------------------------------
+    fused_ids = _reciprocal_rank_fusion([dense_ids, sparse_ids])
 
     results: List[SearchResultItem] = []
-    for chunk_id, distance, doc, meta in zip(ids, distances, documents, metadatas):
-        # ChromaDB returns *cosine distance* (0 = identical, 2 = opposite).
-        # Convert to similarity score in [−1, 1] for interpretability.
-        similarity = 1.0 - distance
+    for chunk_id in fused_ids[: request.top_k]:
+        entry = doc_lookup.get(chunk_id)
+        if entry is None:
+            continue
+        dist = entry["distance"]
+        similarity = round(1.0 - dist, 4) if dist is not None else 0.0
+        meta = entry["meta"] or {}
         results.append(
             SearchResultItem(
                 chunk_id=chunk_id,
                 file_path=meta.get("file_path", ""),
                 start_line=int(meta.get("start_line", 0)),
                 end_line=int(meta.get("end_line", 0)),
-                score=round(similarity, 4),
-                text=doc,
+                score=similarity,
+                text=entry["text"],
             )
         )
 
@@ -2916,10 +3036,11 @@ async def index_now() -> IndexNowResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Indexer not yet initialised.",
         )
-    asyncio.create_task(
-        asyncio.to_thread(_indexer.index_all_sync),
-        name="manual-reindex",
-    )
+    async def _reindex_and_rebuild_bm25() -> None:
+        await asyncio.to_thread(_indexer.index_all_sync)
+        await asyncio.to_thread(_rebuild_bm25_index)
+
+    asyncio.create_task(_reindex_and_rebuild_bm25(), name="manual-reindex")
     return IndexNowResponse(message="Re-indexing started in the background.")
 
 

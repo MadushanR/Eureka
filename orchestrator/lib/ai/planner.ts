@@ -16,6 +16,7 @@ import { generateObject } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import { getUserProfile, formatProfileForPrompt } from "./memory";
+import { withTelemetry } from "./telemetry";
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -132,6 +133,7 @@ export async function generateProjectRoadmap(
                     `USER PROMPT:\n${prompt}`,
             },
         ],
+        ...withTelemetry("devmode.planner"),
     } as Parameters<typeof generateObject>[0]);
 
     console.info(

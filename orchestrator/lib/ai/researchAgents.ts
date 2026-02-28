@@ -11,6 +11,7 @@
 
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
+import { withTelemetry } from "./telemetry";
 
 const DEFAULT_MODEL = process.env.LLM_MODEL_NAME_DEV || process.env.LLM_MODEL_NAME || "gpt-4.1-mini";
 
@@ -83,6 +84,7 @@ export async function runResearcher(topic: string): Promise<string> {
             { role: "system", content: RESEARCHER_PROMPT },
             { role: "user", content: `Research topic: "${topic}"\n\nGather comprehensive facts and cited data points on this topic.` },
         ],
+        ...withTelemetry("research.researcher"),
     } as Parameters<typeof generateText>[0]);
     return (typeof result.text === "string" ? result.text.trim() : "") || "(no research output)";
 }
@@ -130,6 +132,7 @@ export async function runWriter(
             { role: "system", content: systemContent },
             { role: "user", content: userContent },
         ],
+        ...withTelemetry("research.writer"),
     } as Parameters<typeof generateText>[0]);
     return (typeof result.text === "string" ? result.text.trim() : "") || "(no paper output)";
 }
@@ -161,6 +164,7 @@ export async function runReviewer(draft: string, researchFacts: string): Promise
                 content: `Original research facts:\n${researchFacts.slice(0, 3000)}\n\n---\n\nDraft paper to review:\n${draft}`,
             },
         ],
+        ...withTelemetry("research.reviewer"),
     } as Parameters<typeof generateText>[0]);
     const verdict = (typeof result.text === "string" ? result.text.trim() : "") || "";
 
@@ -181,6 +185,7 @@ export async function summarisePaper(paper: string): Promise<string> {
             { role: "system", content: "Summarise the following research paper into exactly 3 concise bullet points. Each bullet should capture a key finding. Output ONLY the 3 bullets, no other text." },
             { role: "user", content: paper.slice(0, 6000) },
         ],
+        ...withTelemetry("research.summariser"),
     } as Parameters<typeof generateText>[0]);
     return (typeof result.text === "string" ? result.text.trim() : "") || "- Research complete.";
 }

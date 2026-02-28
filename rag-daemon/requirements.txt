@@ -20,6 +20,9 @@ chromadb>=0.5.0,<0.6.0             # Local persistent vector store
 # --- Embeddings ----------------------------------------------------------
 sentence-transformers>=3.0.0,<4.0.0  # Local embedding models (all-MiniLM-L6-v2)
 
+# --- Sparse Search (BM25) ------------------------------------------------
+rank-bm25>=0.2.2,<0.3.0            # BM25 sparse retrieval for hybrid search
+
 # --- Utilities -----------------------------------------------------------
 python-dotenv>=1.0.0,<2.0.0        # .env file support (used by pydantic-settings)
 requests>=2.31.0,<3.0.0            # HTTP client for Spotify Web API

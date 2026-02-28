@@ -17,6 +17,7 @@ import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { ModelMessage } from "ai";
 import { getRedisClient } from "@/lib/redis";
+import { withTelemetry } from "./telemetry";
 
 // ---------------------------------------------------------------------------
 // Zod schema — the canonical shape of a developer's long-term profile
@@ -168,6 +169,7 @@ export async function updateUserProfile(
                         `Return the updated profile JSON.`,
                 },
             ],
+            ...withTelemetry("memory.extractProfile"),
         } as Parameters<typeof generateObject>[0]);
 
         const redis = getRedisClient();

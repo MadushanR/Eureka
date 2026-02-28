@@ -23,6 +23,7 @@ import type { StandardMessage, StandardResponse } from "@/types/messaging";
 import { getChatHistory, saveChatMessages, createJob, getJob, updateJob, clearActiveJob, getPendingPatch, getPendingPush, type DevJob, type DevJobPhase } from "@/lib/redis";
 import { getUserProfile, formatProfileForPrompt } from "./memory";
 import { aiTools } from "./tools";
+import { withTelemetry } from "./telemetry";
 
 // ---------------------------------------------------------------------------
 // Model configuration
@@ -399,6 +400,7 @@ async function runGenerate(
         messages,
         tools: aiTools,
         maxSteps,
+        ...withTelemetry("orchestrator.runGenerate"),
     } as Parameters<typeof generateText>[0]);
 
     let text = "";
@@ -636,6 +638,7 @@ async function processDev(
         const planResult = await generateText({
             model: devModel,
             messages: planMessages,
+            ...withTelemetry("orchestrator.devPlan"),
         } as Parameters<typeof generateText>[0]);
         plan = (typeof planResult.text === "string" ? planResult.text.trim() : "") || "";
         planSteps = plan.split("\n").filter((l) => /^\d+[\.\)]/.test(l.trim()));
@@ -769,6 +772,7 @@ async function processDev(
                 const evalResult = await generateText({
                     model: devModel,
                     messages: evalMessages,
+                    ...withTelemetry("orchestrator.devEval"),
                 } as Parameters<typeof generateText>[0]);
                 const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
                 console.info(`[orchestrator:dev] Evaluation verdict: ${verdict}`);
@@ -1009,6 +1013,7 @@ async function executePhase(
                 const evalResult = await generateText({
                     model: devModel,
                     messages: evalMessages,
+                    ...withTelemetry("orchestrator.phaseEval"),
                 } as Parameters<typeof generateText>[0]);
                 const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
                 console.info(`[orchestrator:phase] ${phaseLabel} Eval: ${verdict}`);
@@ -1087,6 +1092,7 @@ async function processDevMultiPhase(
         const decomposeResult = await generateText({
             model: devModel,
             messages: decomposeMessages,
+            ...withTelemetry("orchestrator.decompose"),
         } as Parameters<typeof generateText>[0]);
         const rawText = (typeof decomposeResult.text === "string" ? decomposeResult.text.trim() : "") || "{}";
 
