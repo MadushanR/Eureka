@@ -11,6 +11,7 @@
   "dependencies": {
     "@ai-sdk/openai": "^3.0.33",
     "@upstash/redis": "^1.36.2",
+    "@vercel/functions": "^3.4.3",
     "ai": "^6.0.99",
     "next": "16.1.6",
     "react": "19.2.3",

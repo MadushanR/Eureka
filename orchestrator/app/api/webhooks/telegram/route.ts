@@ -38,9 +38,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { TelegramAdapter, type TelegramUpdate } from "@/lib/adapters/TelegramAdapter";
 import type { StandardMessage } from "@/types/messaging";
-import { processUserMessage, isDevFeatureRequest } from "@/lib/ai/orchestrator";
+import { processUserMessage, isDevFeatureRequest, isResearchRequest } from "@/lib/ai/orchestrator";
+import { countWords, parseResearchMessage, runResearchPipeline } from "@/lib/ai/researchAgents";
+import { shouldRunExtraction, updateUserProfile } from "@/lib/ai/memory";
+import { generateProjectRoadmap } from "@/lib/ai/planner";
+import { executeProjectRoadmap } from "@/lib/ai/executor";
 import { buildPushCompletionUrl } from "@/lib/pushCallback";
-import { getPendingPatch, getPendingPush, getPendingPushOnly, getActiveJob, updateJob } from "@/lib/redis";
+import {
+    getChatHistory,
+    getPendingPatch,
+    getPendingPush,
+    getPendingPushOnly,
+    getActiveJob,
+    updateJob,
+    getActiveResearch,
+    setActiveResearch,
+    clearActiveResearch,
+    setResearchCancelled,
+} from "@/lib/redis";
+import { ResearchCancelledError } from "@/lib/ai/researchAgents";
 
 // ---------------------------------------------------------------------------
 // Environment variable loading (validated at module-initialisation time so
@@ -459,18 +475,275 @@ async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> 
 }
 
 // ---------------------------------------------------------------------------
+// Background dev agent runner (fully isolated from normal message flow)
+// ---------------------------------------------------------------------------
+
+async function runDevAgentInBackground(
+    message: StandardMessage,
+    tgAdapter: TelegramAdapter,
+): Promise<void> {
+    let lastProgressTime = 0;
+    const MIN_PROGRESS_INTERVAL_MS = 3000;
+
+    const onProgress = async (update: string) => {
+        const now = Date.now();
+        if (now - lastProgressTime < MIN_PROGRESS_INTERVAL_MS) return;
+        lastProgressTime = now;
+        try {
+            await tgAdapter.sendResponse({ text: `[progress] ${update}` }, message.senderId);
+        } catch (e) {
+            console.error(`[telegram/webhook] Failed to send progress update:`, e);
+        }
+    };
+
+    try {
+        const { response } = await processUserMessage(message, { devMode: true, onProgress });
+        await tgAdapter.sendResponse(response, message.senderId);
+        console.info(`[telegram/webhook] Dev flow completed; summary sent to sender=${message.senderId}.`);
+    } catch (error) {
+        console.error(`[telegram/webhook] Dev agent background error for sender=${message.senderId}:`, error);
+        try {
+            await tgAdapter.sendResponse(
+                { text: "The dev agent hit an unexpected error. Please try again." },
+                message.senderId,
+            );
+        } catch { /* best effort */ }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background research runner (multi-agent pipeline)
+// ---------------------------------------------------------------------------
+
+async function runResearchInBackground(
+    message: StandardMessage,
+    tgAdapter: TelegramAdapter,
+): Promise<void> {
+    const senderId = message.senderId;
+    let lastProgressTime = 0;
+    const MIN_PROGRESS_INTERVAL_MS = 3000;
+
+    const onProgress = async (update: string) => {
+        const now = Date.now();
+        if (now - lastProgressTime < MIN_PROGRESS_INTERVAL_MS) return;
+        lastProgressTime = now;
+        try {
+            await tgAdapter.sendResponse({ text: `[research] ${update}` }, senderId);
+        } catch (e) {
+            console.error(`[telegram/webhook] Failed to send research progress:`, e);
+        }
+    };
+
+    const getIsCancelled = async (): Promise<boolean> => {
+        const r = await getActiveResearch(senderId);
+        return r?.cancelled === true;
+    };
+
+    try {
+        const { topic, targetWords } = parseResearchMessage(message.text);
+        console.info(`[telegram/webhook] Starting research pipeline for sender=${senderId}${targetWords != null ? ` (target: ${targetWords} words)` : ""}`);
+        const result = await runResearchPipeline(topic, onProgress, getIsCancelled, { targetWords });
+
+        // Save paper as PDF on Desktop via daemon
+        const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
+        const workspacePath = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "C:/Users/madus/Desktop";
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const filename = `research-paper-${timestamp}.pdf`;
+
+        let savedPath = "";
+        if (daemonUrl) {
+            try {
+                const saveRes = await fetch(`${daemonUrl}/save-markdown-as-pdf`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        workspace_path: workspacePath,
+                        filename,
+                        content: result.paper,
+                    }),
+                });
+                const saveData = (await saveRes.json().catch(() => ({}))) as { success?: boolean; path?: string; message?: string };
+                if (saveData.success) {
+                    savedPath = saveData.path ?? filename;
+                    console.info(`[telegram/webhook] Research paper saved as PDF: ${savedPath}`);
+                } else {
+                    console.warn(`[telegram/webhook] Failed to save paper as PDF: ${saveData.message}`);
+                }
+            } catch (e) {
+                console.error(`[telegram/webhook] Error saving research paper:`, e);
+            }
+        }
+
+        const wordCount = countWords(result.paper);
+        const responseLines = [
+            "Research complete! Here are the key findings:",
+            "",
+            result.summary,
+            "",
+            savedPath
+                ? `The full paper (~${wordCount} words, ${result.reviewRounds} review round${result.reviewRounds !== 1 ? "s" : ""}) has been saved on your Desktop as a PDF:\n${savedPath}`
+                : `The paper is ~${wordCount} words (${result.reviewRounds} review round${result.reviewRounds !== 1 ? "s" : ""}).`,
+        ];
+
+        await tgAdapter.sendResponse({ text: responseLines.join("\n") }, senderId);
+        console.info(`[telegram/webhook] Research completed for sender=${senderId}.`);
+    } catch (error) {
+        if (error instanceof ResearchCancelledError) {
+            console.info(`[telegram/webhook] Research cancelled by user for sender=${senderId}.`);
+            try {
+                await tgAdapter.sendResponse({ text: "Research cancelled." }, senderId);
+            } catch { /* best effort */ }
+        } else {
+            console.error(`[telegram/webhook] Research pipeline error for sender=${senderId}:`, error);
+            try {
+                await tgAdapter.sendResponse(
+                    { text: "The research pipeline hit an unexpected error. Please try again." },
+                    senderId,
+                );
+            } catch { /* best effort */ }
+        }
+    } finally {
+        await clearActiveResearch(senderId);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full-project build (single-prompt autonomous build) — intent from user input
+// ---------------------------------------------------------------------------
+
+/** Phrases that indicate the user wants a full app built from one prompt (no keyword). */
+const FULL_BUILD_INTENT_PHRASES = [
+    "build an entire",
+    "build a full",
+    "build me a complete",
+    "build me a full",
+    "build me an entire",
+    "build a complete",
+    "create an entire",
+    "create a full",
+    "create a complete",
+    "create me a complete",
+    "create me a full",
+    "build from scratch",
+    "create from scratch",
+    "build a whole",
+    "create a whole",
+    "build me a whole app",
+    "build me a whole application",
+];
+
+function isFullBuildIntent(text: string): boolean {
+    const t = text.trim().toLowerCase();
+    if (t.length < 15) return false;
+    return FULL_BUILD_INTENT_PHRASES.some((phrase) => t.includes(phrase));
+}
+
+/** Parse optional "repo name: X" or "project name: X" from the message. Returns prompt (with that part removed) and preferred name. */
+function parseFullBuildMessage(text: string): { prompt: string; preferredProjectName?: string } {
+    const trimmed = text.trim();
+    const match =
+        trimmed.match(/\b(?:repo|project)\s*name\s*:\s*([^\n,]+)/i) ||
+        trimmed.match(/\b(?:repo|project)\s*:\s*([^\n,]+)/i);
+    const preferredProjectName = match ? match[1].trim().replace(/\s+/g, "-") : undefined;
+    let prompt = trimmed;
+    if (preferredProjectName) {
+        prompt = trimmed
+            .replace(/\b(?:repo|project)\s*name\s*:\s*[^\n,]+/gi, "")
+            .replace(/\b(?:repo|project)\s*:\s*[^\n,]+/gi, "")
+            .replace(/\s{2,}/g, " ")
+            .replace(/^[\s,]+|[\s,]+$/g, "")
+            .trim();
+    }
+    return { prompt, preferredProjectName };
+}
+
+async function runFullBuildInBackground(
+    message: StandardMessage,
+    tgAdapter: TelegramAdapter,
+): Promise<void> {
+    const senderId = message.senderId;
+    let lastProgressTime = 0;
+    const MIN_UPDATE_INTERVAL_MS = 15_000;
+
+    const sendUpdate = async (update: string) => {
+        const now = Date.now();
+        const elapsed = now - lastProgressTime;
+        if (elapsed < MIN_UPDATE_INTERVAL_MS && lastProgressTime > 0) {
+            await new Promise((r) => setTimeout(r, MIN_UPDATE_INTERVAL_MS - elapsed));
+        }
+        lastProgressTime = Date.now();
+        try {
+            await tgAdapter.sendResponse({ text: `[build] ${update}` }, senderId);
+        } catch (e) {
+            console.error(`[build] Failed to send progress:`, e);
+        }
+    };
+
+    const { prompt, preferredProjectName } = parseFullBuildMessage(message.text);
+
+    try {
+        console.info(
+            `[build] Planning for sender=${senderId}: "${prompt.slice(0, 80)}"` +
+                (preferredProjectName ? ` (repo: ${preferredProjectName})` : ""),
+        );
+
+        const plan = await generateProjectRoadmap(prompt, senderId, {
+            preferredProjectName,
+        });
+
+        await sendUpdate(
+            `Roadmap ready: ${plan.projectName} (${plan.techStack}). ${plan.steps.length} phases. Building in background...`,
+        );
+
+        // Phase 2: Execute all steps + push
+        await executeProjectRoadmap(plan, senderId, sendUpdate);
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[build] Fatal error for sender=${senderId}:`, error);
+            try {
+                await tgAdapter.sendResponse(
+                    { text: `Build failed:\n${errMsg.slice(0, 500)}` },
+                    senderId,
+                );
+            } catch { /* best effort */ }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Long-term memory extraction (background, non-blocking)
+// ---------------------------------------------------------------------------
+
+function triggerMemoryExtraction(senderId: string): void {
+    const run = async () => {
+        try {
+            const shouldRun = await shouldRunExtraction(senderId);
+            if (!shouldRun) return;
+            console.info(`[memory] Triggering profile extraction for sender=${senderId}`);
+            const history = await getChatHistory(senderId);
+            if (history.length === 0) return;
+            await updateUserProfile(senderId, history);
+        } catch (error) {
+            console.error(`[memory] Background extraction failed for sender=${senderId}:`, error);
+        }
+    };
+
+    (async () => {
+        try {
+            const { waitUntil } = await import("@vercel/functions");
+            waitUntil(run());
+        } catch {
+            void run();
+        }
+    })();
+}
+
+// ---------------------------------------------------------------------------
 // Downstream message processing — wired to the LLM orchestrator
 // ---------------------------------------------------------------------------
 
 /**
- * Process an authorised, normalised message through the full LLM pipeline:
- *   1. Load chat history from Redis.
- *   2. Run generateText (Vercel AI SDK) with tools (RAG search, patch approval).
- *   3. Persist the updated history to Redis.
- *   4. Send the final StandardResponse back via the Telegram adapter.
- *
- * Any unhandled errors must NOT propagate to the route handler —
- * that would break the 200 guarantee.  All errors are caught and logged.
+ * Process an authorised, normalised message through the full LLM pipeline.
+ * Normal (non-dev) messages only — dev requests are handled by runDevAgentInBackground.
  */
 async function processMessage(message: StandardMessage): Promise<void> {
     try {
@@ -497,21 +770,30 @@ async function processMessage(message: StandardMessage): Promise<void> {
             return;
         }
 
-        // "status" command: return progress of active dev job
+        // "status" command: return progress of active dev job or research
         const lowerText = message.text.trim().toLowerCase();
         if (lowerText === "status" || lowerText === "/status") {
             const activeJob = await getActiveJob(message.senderId);
-            if (!activeJob) {
-                await getAdapter().sendResponse({ text: "No active job running." }, message.senderId);
-            } else {
+            const activeResearch = await getActiveResearch(message.senderId);
+
+            if (activeJob) {
                 const elapsed = Math.round((Date.now() - activeJob.started_at) / 1000);
                 const lines = [
                     `Job: ${activeJob.goal.slice(0, 80)}`,
                     `Status: ${activeJob.status}`,
-                    `Step: ${activeJob.current_step}/${activeJob.total_steps}`,
-                    `Current: ${activeJob.current_action}`,
-                    `Elapsed: ${elapsed}s`,
                 ];
+                if (activeJob.phases && activeJob.phases.length > 0) {
+                    const cp = activeJob.current_phase ?? 0;
+                    lines.push(`Phase: ${cp}/${activeJob.total_phases ?? activeJob.phases.length}`);
+                    for (const p of activeJob.phases) {
+                        const icon = p.status === "complete" ? "done" : p.status === "executing" ? "..." : p.status === "failed" ? "FAIL" : "-";
+                        lines.push(`  [${icon}] ${p.name}`);
+                    }
+                } else {
+                    lines.push(`Step: ${activeJob.current_step}/${activeJob.total_steps}`);
+                }
+                lines.push(`Current: ${activeJob.current_action}`);
+                lines.push(`Elapsed: ${elapsed}s`);
                 if (activeJob.steps_completed.length > 0) {
                     lines.push(`Done: ${activeJob.steps_completed.join(", ")}`);
                 }
@@ -519,50 +801,146 @@ async function processMessage(message: StandardMessage): Promise<void> {
                     lines.push(`Errors: ${activeJob.errors.slice(-2).join("; ")}`);
                 }
                 await getAdapter().sendResponse({ text: lines.join("\n") }, message.senderId);
+            } else if (activeResearch && !activeResearch.cancelled) {
+                const elapsed = Math.round((Date.now() - activeResearch.started_at) / 1000);
+                await getAdapter().sendResponse(
+                    {
+                        text: `Research in progress (${elapsed}s)\nTopic: ${activeResearch.topic.slice(0, 80)}\n\nSend "cancel" to stop.`,
+                    },
+                    message.senderId,
+                );
+            } else {
+                await getAdapter().sendResponse({ text: "No active job or research running." }, message.senderId);
             }
             return;
         }
 
-        // "cancel" command: cancel active dev job
+        // "cancel" command: cancel active dev job or research
         if (lowerText === "cancel" || lowerText === "/cancel") {
             const activeJob = await getActiveJob(message.senderId);
-            if (!activeJob) {
-                await getAdapter().sendResponse({ text: "No active job to cancel." }, message.senderId);
-            } else {
+            const activeResearch = await getActiveResearch(message.senderId);
+
+            if (activeJob) {
                 await updateJob(activeJob.id, { status: "cancelled", finished_at: Date.now() });
                 await getAdapter().sendResponse(
                     { text: `Cancelled job: ${activeJob.goal.slice(0, 80)}\n(Note: changes already applied to files remain.)` },
                     message.senderId,
                 );
+            } else if (activeResearch && !activeResearch.cancelled) {
+                await setResearchCancelled(message.senderId);
+                await getAdapter().sendResponse(
+                    { text: "Research cancelled. The pipeline will stop after the current step." },
+                    message.senderId,
+                );
+            } else {
+                await getAdapter().sendResponse({ text: "No active job or research to cancel." }, message.senderId);
             }
             return;
         }
 
-        // Dev feature requests: send immediate ack, then run dev-agent with progress updates.
-        if (isDevFeatureRequest(message.text)) {
+        // Full-project build: single-prompt autonomous build (intent from user input)
+        if (isFullBuildIntent(message.text)) {
+            const activeJob = await getActiveJob(message.senderId);
+            const activeResearch = await getActiveResearch(message.senderId);
+            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
+                await getAdapter().sendResponse(
+                    { text: `A job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" or "cancel" first.` },
+                    message.senderId,
+                );
+                return;
+            }
+            if (activeResearch && !activeResearch.cancelled) {
+                await getAdapter().sendResponse(
+                    { text: `Research is running: "${activeResearch.topic.slice(0, 60)}"\nSend "cancel" first.` },
+                    message.senderId,
+                );
+                return;
+            }
+
             const tgAdapter = getAdapter();
             await tgAdapter.sendResponse(
-                { text: "Starting dev agent. I'll send you live updates as I work." },
+                {
+                    text: "Building your project from your prompt…\n\n" +
+                        "This runs in the background — you can keep chatting. I'll only message you for important milestones (roadmap ready, each phase done, push, done). Send \"status\" to check progress or \"cancel\" to abort.",
+                },
                 message.senderId,
             );
 
-            let lastProgressTime = 0;
-            const MIN_PROGRESS_INTERVAL_MS = 3000;
+            const runBuild = () => runFullBuildInBackground(message, tgAdapter);
+            try {
+                const { waitUntil } = await import("@vercel/functions");
+                waitUntil(runBuild());
+            } catch {
+                void runBuild();
+            }
+            return;
+        }
 
-            const onProgress = async (update: string) => {
-                const now = Date.now();
-                if (now - lastProgressTime < MIN_PROGRESS_INTERVAL_MS) return;
-                lastProgressTime = now;
-                try {
-                    await tgAdapter.sendResponse({ text: `[progress] ${update}` }, message.senderId);
-                } catch (e) {
-                    console.error(`[telegram/webhook] Failed to send progress update:`, e);
-                }
-            };
+        // Research requests: multi-agent pipeline (Researcher → Writer → Reviewer)
+        if (isResearchRequest(message.text)) {
+            const activeJob = await getActiveJob(message.senderId);
+            const activeResearch = await getActiveResearch(message.senderId);
+            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
+                await getAdapter().sendResponse(
+                    { text: `A dev job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" or "cancel" first.` },
+                    message.senderId,
+                );
+                return;
+            }
+            if (activeResearch && !activeResearch.cancelled) {
+                await getAdapter().sendResponse(
+                    { text: `Research is already in progress: "${activeResearch.topic.slice(0, 60)}"\nSend "status" to check or "cancel" to stop.` },
+                    message.senderId,
+                );
+                return;
+            }
 
-            const { response } = await processUserMessage(message, { devMode: true, onProgress });
-            await tgAdapter.sendResponse(response, message.senderId);
-            console.info(`[telegram/webhook] Dev flow completed; summary sent to sender=${message.senderId}.`);
+            const tgAdapter = getAdapter();
+            await setActiveResearch(message.senderId, message.text);
+            await tgAdapter.sendResponse(
+                {
+                    text: "Assembling the research team. I'll run in the background — you can keep chatting. I'll notify you when the paper is ready. Send \"status\" to check progress or \"cancel\" to stop.",
+                },
+                message.senderId,
+            );
+
+            const runResearch = () => runResearchInBackground(message, tgAdapter);
+            try {
+                const { waitUntil } = await import("@vercel/functions");
+                waitUntil(runResearch());
+            } catch {
+                void runResearch();
+            }
+            return;
+        }
+
+        // Dev feature requests: check for active job or research, then fire off background agent.
+        if (isDevFeatureRequest(message.text)) {
+            const activeJob = await getActiveJob(message.senderId);
+            const activeResearch = await getActiveResearch(message.senderId);
+            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
+                await getAdapter().sendResponse(
+                    { text: `A dev job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" to check progress or "cancel" to stop it.` },
+                    message.senderId,
+                );
+                return;
+            }
+            if (activeResearch && !activeResearch.cancelled) {
+                await getAdapter().sendResponse(
+                    { text: `Research is still running: "${activeResearch.topic.slice(0, 60)}"\nSend "status" or "cancel" first.` },
+                    message.senderId,
+                );
+                return;
+            }
+
+            const tgAdapter = getAdapter();
+            await tgAdapter.sendResponse(
+                { text: "Starting dev agent. I'll send you live updates as I work. You can keep chatting — I'll notify you when done." },
+                message.senderId,
+            );
+
+            // Fire-and-forget: dev agent runs in the background
+            void runDevAgentInBackground(message, tgAdapter);
             return;
         }
 
@@ -574,6 +952,9 @@ async function processMessage(message: StandardMessage): Promise<void> {
         await getAdapter().sendResponse(response, message.senderId);
 
         console.info(`[telegram/webhook] Reply sent to sender=${message.senderId}.`);
+
+        // Long-term memory: every N messages, extract permanent facts in the background
+        triggerMemoryExtraction(message.senderId);
     } catch (error) {
         // Log the error but do NOT re-throw — we've already returned 200 to
         // Telegram and cannot change that now.

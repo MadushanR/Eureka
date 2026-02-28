@@ -150,6 +150,13 @@ class DaemonSettings(BaseSettings):
     """Refresh token from OAuth (one-time auth flow). Used to get access tokens."""
 
     # ------------------------------------------------------------------
+    # GitHub (optional — if set, daemon can create repos via REST API)
+    # ------------------------------------------------------------------
+
+    github_token: Optional[str] = None
+    """Personal Access Token with `repo` scope. Used by /github/create-repo."""
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
 

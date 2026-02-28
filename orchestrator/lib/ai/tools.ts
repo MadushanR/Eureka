@@ -669,6 +669,65 @@ export const runTests = tool({
 });
 
 /**
+ * Tool: run_scaffold
+ * ------------------
+ * Run a project scaffolding/initialization command (e.g. npx create-next-app).
+ * Longer timeout (300s), shell=True. Only allowed scaffold commands are accepted.
+ */
+export const runScaffold = tool({
+    description:
+        "Run a project scaffolding or initialization command. Use for setting up new projects with framework CLIs. " +
+        "Allowed commands: npx create-next-app, npx create-react-app, npx create-vite, django-admin startproject, " +
+        "npm init, yarn init, pnpm init, pnpm create, python -m venv, pip install, git init. " +
+        "Has a 300 second timeout. The workspace directory is created automatically if it doesn't exist.",
+    inputSchema: z.object({
+        workspace_path: z
+            .string()
+            .min(1, "workspace_path must not be empty.")
+            .describe("Absolute path to the directory where the command should run."),
+        command_line: z
+            .string()
+            .min(1, "command_line must not be empty.")
+            .describe("Scaffold command to run, e.g. 'npx create-next-app@latest my-app --typescript --tailwind --eslint --app --use-npm'."),
+    }),
+    async execute({
+        workspace_path,
+        command_line,
+    }: {
+        workspace_path: string;
+        command_line: string;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) {
+            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        }
+        try {
+            const res = await fetch(`${base}/run-scaffold`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    workspace_path: workspace_path.trim(),
+                    command_line: command_line.trim(),
+                }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean;
+                stdout?: string;
+                stderr?: string;
+                exit_code?: number;
+                error?: string;
+            };
+            if (!res.ok) {
+                return { success: false, error: data.error ?? `Daemon returned ${res.status}` };
+            }
+            return data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+        }
+    },
+});
+
+/**
  * Tool: create_file
  * -----------------
  * Create a new file in the workspace. Parent directories are created automatically.
@@ -800,6 +859,118 @@ export const batchCreateFiles = tool({
             };
             if (!res.ok || data.success === false) {
                 return { success: false, error: `${data.failed ?? 0} file(s) failed.`, results: data.results };
+            }
+            return data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+        }
+    },
+});
+
+/**
+ * Tool: github_create_repo
+ * ------------------------
+ * Create a new GitHub repository via the REST API.
+ */
+export const githubCreateRepo = tool({
+    description:
+        "Create a new GitHub repository. Returns the repo URL and clone URL. " +
+        "Use this as the first step when the user asks to create a new project from scratch.",
+    inputSchema: z.object({
+        name: z
+            .string()
+            .min(1)
+            .describe("Repository name (e.g. 'my-todo-app'). Letters, numbers, hyphens, dots, underscores only."),
+        description: z
+            .string()
+            .optional()
+            .describe("Short description for the repo."),
+        private: z
+            .boolean()
+            .optional()
+            .describe("Whether the repo should be private. Defaults to false (public)."),
+    }),
+    async execute({
+        name,
+        description,
+        private: isPrivate,
+    }: {
+        name: string;
+        description?: string;
+        private?: boolean;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        try {
+            const res = await fetch(`${base}/github/create-repo`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name, description: description ?? "", private: isPrivate ?? false }),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean; message?: string; html_url?: string; clone_url?: string; name?: string;
+            };
+            if (!res.ok || data.success === false) {
+                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
+            }
+            return data;
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+        }
+    },
+});
+
+/**
+ * Tool: git_clone
+ * ---------------
+ * Clone a GitHub repository into an allowed workspace directory.
+ */
+export const gitClone = tool({
+    description:
+        "Clone a GitHub repository into a local directory. " +
+        "Use after github_create_repo to clone the newly created repo. " +
+        "Returns local_path which you should use as workspace_path for subsequent tools (batch_create_files, run_tests, etc.). " +
+        "Do NOT pass parent_directory — the default is already configured correctly.",
+    inputSchema: z.object({
+        clone_url: z
+            .string()
+            .min(1)
+            .describe("HTTPS clone URL from github_create_repo (e.g. 'https://github.com/user/repo.git')."),
+        parent_directory: z
+            .string()
+            .optional()
+            .describe("DO NOT SET THIS. The default parent directory is pre-configured. Only override if explicitly told to clone somewhere specific."),
+        folder_name: z
+            .string()
+            .optional()
+            .describe("Override the cloned folder name. Defaults to the repo name."),
+    }),
+    async execute({
+        clone_url,
+        parent_directory,
+        folder_name,
+    }: {
+        clone_url: string;
+        parent_directory?: string;
+        folder_name?: string;
+    }): Promise<unknown> {
+        const base = LOCAL_DAEMON_BASE();
+        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
+        const parentDir = parent_directory?.trim() || process.env.LOCAL_DAEMON_WORKSPACE_PATH?.trim();
+        if (!parentDir) return { success: false, error: "Could not determine parent directory. Set LOCAL_DAEMON_WORKSPACE_PATH." };
+        try {
+            const body: Record<string, string> = { clone_url, parent_directory: parentDir };
+            if (folder_name) body.folder_name = folder_name;
+            const res = await fetch(`${base}/git/clone`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const data = (await res.json().catch(() => ({}))) as {
+                success?: boolean; message?: string; local_path?: string;
+            };
+            if (!res.ok || data.success === false) {
+                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
             }
             return data;
         } catch (e) {
@@ -1685,6 +1856,8 @@ export const aiTools = {
     search_local_codebase: searchLocalCodebase,
     create_file: createFile,
     batch_create_files: batchCreateFiles,
+    github_create_repo: githubCreateRepo,
+    git_clone: gitClone,
     delete_code: deleteCode,
     insert_code: insertCode,
     edit_file: editFile,
@@ -1699,6 +1872,7 @@ export const aiTools = {
     list_folder_contents: listFolderContents,
     read_file: readFile,
     run_tests: runTests,
+    run_scaffold: runScaffold,
     delete_path: deletePath,
     spotify_play: spotifyPlay,
     spotify_pause: spotifyPause,

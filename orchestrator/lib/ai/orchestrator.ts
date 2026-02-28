@@ -20,7 +20,8 @@
 import { generateText, type ModelMessage } from "ai";
 import { openai } from "@ai-sdk/openai";
 import type { StandardMessage, StandardResponse } from "@/types/messaging";
-import { getChatHistory, saveChatMessages, createJob, updateJob, clearActiveJob, type DevJob } from "@/lib/redis";
+import { getChatHistory, saveChatMessages, createJob, getJob, updateJob, clearActiveJob, getPendingPatch, getPendingPush, type DevJob, type DevJobPhase } from "@/lib/redis";
+import { getUserProfile, formatProfileForPrompt } from "./memory";
 import { aiTools } from "./tools";
 
 // ---------------------------------------------------------------------------
@@ -28,14 +29,15 @@ import { aiTools } from "./tools";
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the model to use for this orchestrator.
- *
- * You can override the default by setting LLM_MODEL_NAME in the environment,
- * e.g. "gpt-4.1" or "gpt-4.1-mini".
+ * LLM_MODEL_NAME     — used for normal chat / quick queries.
+ * LLM_MODEL_NAME_DEV — used for the dev agent (plan, execute, evaluate).
+ *                       Falls back to LLM_MODEL_NAME if not set.
  */
 const MODEL_NAME = process.env.LLM_MODEL_NAME || "gpt-4.1-mini";
+const MODEL_NAME_DEV = process.env.LLM_MODEL_NAME_DEV || MODEL_NAME;
 
 const model = openai(MODEL_NAME);
+const devModel = openai(MODEL_NAME_DEV);
 
 // ---------------------------------------------------------------------------
 // Type guards
@@ -193,6 +195,21 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
  * to build, implement, or add something (e.g. "build auth for Eureka").
  * Used to trigger a two-phase reply: immediate "working on it" then a summary.
  */
+export function isResearchRequest(text: string): boolean {
+    const t = text.trim().toLowerCase();
+    const triggers = [
+        "do research on",
+        "research on",
+        "research about",
+        "write a paper",
+        "write a research",
+        "write paper",
+        "research paper",
+        "investigate ",
+    ];
+    return triggers.some((phrase) => t.includes(phrase));
+}
+
 export function isDevFeatureRequest(text: string): boolean {
     const t = text.trim().toLowerCase();
     const triggers = [
@@ -231,6 +248,7 @@ const SYSTEM_PROMPT_NORMAL =
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
     "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, remove_lines_matching, or delete_code) so they can resolve the path themselves. " +
     "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
+    "When the user asks to create a new GitHub repo, use github_create_repo. When they ask to clone a repo, use git_clone. " +
     "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
     "Always finish with a concise reply that explains what you did or found.";
 
@@ -238,49 +256,126 @@ const SYSTEM_PROMPT_DEV_PLAN =
     "You are a planning agent. Given the user's request, produce a short numbered plan of concrete steps. " +
     "Each step should name which tool to use and what arguments to pass.\n\n" +
     "Available tools:\n" +
+    "- github_create_repo(name, description?, private?): Create or get a GitHub repo. If it already exists, returns the existing repo's URL. Returns html_url and clone_url.\n" +
+    "- git_clone(clone_url): Clone a repo locally. Only pass clone_url. If already cloned, returns existing local_path.\n" +
+    "- batch_create_files(workspace_path, files[]): Create multiple new files at once.\n" +
+    "- create_file(workspace_path, file_path, content): Create a single new file.\n" +
     "- read_file(path, start_line?, end_line?): Read a file with line numbers.\n" +
-    "- insert_code(file_path, after_line, new_code, repo_name?): Insert new code after a line number. Use for adding new features.\n" +
-    "- edit_file(file_path, search_string, replace_string, repo_name?): Modify existing code via search/replace.\n" +
-    "- delete_code(file_path, search_term, repo_name?): Delete an entire function/class/endpoint block.\n" +
-    "- create_file(file_path, content, repo_name?): Create a single new file.\n" +
-    "- batch_create_files(files[], repo_name?): Create multiple new files at once (for multi-file features).\n" +
-    "- search_local_codebase(query): Semantic code search.\n" +
-    "- run_tests(workspace_path, command_line): Run tests/builds (npm test, pytest, npm install, npm run build, etc.).\n" +
-    "- list_git_repos, get_uncommitted_changes: Git helpers.\n\n" +
+    "- insert_code(file_path, after_line, new_code): Insert new code after a line number.\n" +
+    "- edit_file(file_path, search_string, replace_string): Modify existing code via search/replace.\n" +
+    "- delete_code(file_path, search_term): Delete an entire function/class/endpoint block.\n" +
+    "- run_tests(workspace_path, command_line): Run tests/builds (pytest, npm test, etc.).\n" +
+    "- prepare_push_approval(workspace_path, commit_message): Commit+push for user approval.\n\n" +
+    "CRITICAL — When the user says 'create a repo' or 'create a new project', the plan MUST follow this exact pattern:\n" +
+    "  1. github_create_repo(name=...) — create the repo on GitHub\n" +
+    "  2. git_clone(clone_url=<from step 1>) — clone it locally\n" +
+    "  3. batch_create_files(workspace_path=<local_path from step 2>, files=[...]) — write ALL app code, test files, AND requirements.txt (include pytest)\n" +
+    "  4. run_tests(workspace_path=<local_path from step 2>, command_line='pip install -r requirements.txt') — install dependencies\n" +
+    "  5. run_tests(workspace_path=<local_path from step 2>, command_line='python -m pytest') — run tests\n" +
+    "  6. prepare_push_approval(workspace_path=<local_path from step 2>, commit_message=...) — commit and push\n" +
+    "Do NOT skip github_create_repo or git_clone. Do NOT try to read_file on a repo that doesn't exist yet.\n\n" +
+    "For changes to EXISTING repos, start by reading the target file(s).\n\n" +
     "Rules:\n" +
-    "- ALWAYS start by reading the target file(s) to see their current content and line numbers.\n" +
-    "- For new code, use insert_code. For modifications, use edit_file. For deletions, use delete_code.\n" +
-    "- For multi-file features, prefer batch_create_files to create all new files in one step.\n" +
     "- Do NOT write unified diffs. The daemon generates them.\n" +
-    "- Keep the plan short (3-8 steps max).\n" +
+    "- Keep the plan short (3-8 steps).\n" +
     "- Output ONLY the numbered plan, no other text.";
 
 const SYSTEM_PROMPT_DEV_EXECUTE =
-    "You are a dev agent executing a plan. Follow the plan below step by step using the available tools.\n\n" +
+    "You are a dev agent. Execute ALL steps of the plan below using the available tools. " +
+    "You MUST complete every step in a SINGLE pass — do NOT stop partway through.\n\n" +
     "Available tools:\n" +
-    "- read_file: Read a file's contents (with line numbers). Use start_line/end_line for large files.\n" +
-    "- insert_code: INSERT NEW CODE after a specific line number. Provide file_path, after_line, new_code.\n" +
-    "- edit_file: MODIFY EXISTING CODE via search/replace. Provide file_path, search_string, replace_string.\n" +
-    "- delete_code: DELETE an entire function/class/endpoint block. Provide file_path and search_term.\n" +
-    "- create_file: CREATE A SINGLE NEW FILE. Provide file_path and content.\n" +
-    "- batch_create_files: CREATE MULTIPLE NEW FILES at once. Provide an array of { file_path, content }.\n" +
-    "- search_local_codebase: Semantic code search.\n" +
-    "- run_tests: Run tests/build/install commands (npm test, pytest, npm install, npm run build, etc.).\n" +
-    "- list_git_repos, get_uncommitted_changes: Git helpers.\n\n" +
-    "When the user names a repo (e.g. 'Eureka'), use repo_name in tools that accept it.\n\n" +
-    "Critical rules:\n" +
-    "1. Execute each step of the plan in order.\n" +
-    "2. Do NOT stop after read_file — always follow through with the action tool (insert_code, edit_file, delete_code, create_file, or batch_create_files).\n" +
-    "3. Do NOT write unified diffs yourself. The daemon generates them.\n" +
-    "4. If a tool fails, try to fix the issue (e.g. re-read the file, adjust arguments) and retry.\n" +
-    "5. End with a short summary of what you did.";
+    "- github_create_repo: Create a GitHub repo. Provide name. Returns html_url and clone_url. If repo already exists, it returns the existing repo's URL — that's fine, just continue.\n" +
+    "- git_clone: Clone a repo. Provide ONLY clone_url. Do NOT pass parent_directory. Returns local_path. If already cloned, returns the existing local_path — that's fine, just continue.\n" +
+    "- batch_create_files: Create multiple files. Provide workspace_path and files array [{file_path, content}].\n" +
+    "- create_file: Create one file. Provide workspace_path, file_path, and content.\n" +
+    "- read_file: Read a file with line numbers.\n" +
+    "- insert_code: Insert code after a line number.\n" +
+    "- edit_file: Modify code via search/replace.\n" +
+    "- delete_code: Delete a function/class/endpoint block.\n" +
+    "- run_tests: Run a command (pytest, npm test, etc.). Provide workspace_path and command_line.\n" +
+    "- prepare_push_approval: Commit+push for approval. Provide workspace_path and commit_message.\n\n" +
+    "CRITICAL RULES:\n" +
+    "1. Execute ALL steps — do NOT stop after one or two tool calls.\n" +
+    "2. For new projects: github_create_repo → git_clone → batch_create_files → run_tests → prepare_push_approval, ALL in sequence.\n" +
+    "3. For batch_create_files: pass workspace_path = the local_path from git_clone. Write COMPLETE file contents — not stubs.\n" +
+    "4. ALWAYS include a requirements.txt (with pytest for Python projects). Run 'pip install -r requirements.txt' BEFORE running tests.\n" +
+    "5. Do NOT stop after github_create_repo or git_clone — you MUST continue to create files, install deps, test, and push.\n" +
+    "6. Do NOT write unified diffs. The daemon handles that.\n" +
+    "7. If a tool returns success=true (even with 'already exists'), treat it as DONE and move to the NEXT step. Never retry a succeeded step.\n" +
+    "8. ALWAYS include the GitHub repo URL (html_url) in your final summary.\n" +
+    "9. End with a concise summary of everything you did.\n" +
+    "10. NEVER stop and ask for user input. Always proceed autonomously through every step.";
 
 const SYSTEM_PROMPT_DEV_EVALUATE =
     "You are a QA evaluator. The user asked for a specific change. The dev agent executed some steps. " +
     "Based on the tool results below, determine: did the agent fully complete the task?\n\n" +
+    "IMPORTANT: If a tool returned success=true with a message like 'already exists' or 'using existing', " +
+    "that step IS complete — do NOT mark it as incomplete. Focus only on what has NOT been done yet.\n\n" +
     "Reply with EXACTLY one of:\n" +
     "- COMPLETE: <one sentence summary of what was done>\n" +
-    "- INCOMPLETE: <what is still missing and what the agent should do next>\n" +
+    "- INCOMPLETE: <what is still missing and what the agent should do next — be specific about the NEXT action>\n" +
+    "- FAILED: <what went wrong>";
+
+// ---------------------------------------------------------------------------
+// Multi-phase prompts
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT_DEV_DECOMPOSE =
+    "You are a project architect. Break the user's request into sequential build phases.\n\n" +
+    "Rules:\n" +
+    "- Phase 0 is ALWAYS 'setup': create GitHub repo, clone, scaffold (if applicable), install deps.\n" +
+    "- Subsequent phases are feature modules, each self-contained (3-8 files max per phase).\n" +
+    "- Order phases so later ones can depend on earlier ones (e.g. models before API, API before frontend).\n" +
+    "- Each phase must have: name (short), description (what to build), files (list of relative file paths to create/edit).\n" +
+    "- For small projects (<=8 files total), use just 2 phases: setup + implementation.\n" +
+    "- For medium projects (9-20 files), use 3-5 phases.\n" +
+    "- For large projects (20+ files), use 5-10 phases.\n\n" +
+    "Available scaffold commands (for phase 0):\n" +
+    "- npx create-next-app@latest <name> --typescript --tailwind --eslint --app --use-npm\n" +
+    "- npx create-vite <name> --template react-ts\n" +
+    "- django-admin startproject <name>\n" +
+    "- python -m venv venv\n" +
+    "- npm init -y / yarn init -y / pnpm init\n\n" +
+    "Output ONLY valid JSON — no markdown fences, no explanation. Format:\n" +
+    '{\n' +
+    '  "project_name": "my-project",\n' +
+    '  "scaffold_command": "npx create-next-app@latest my-project --typescript --tailwind --eslint --app --use-npm",\n' +
+    '  "phases": [\n' +
+    '    { "name": "Setup", "description": "Create repo, clone, scaffold, install deps", "files": ["package.json", "tsconfig.json"] },\n' +
+    '    { "name": "Data Models", "description": "Create database models and types", "files": ["src/types/product.ts", "src/lib/db.ts"] }\n' +
+    '  ]\n' +
+    '}';
+
+const SYSTEM_PROMPT_PHASE_EXECUTE =
+    "You are a dev agent building ONE module of a larger project. " +
+    "The repo already exists locally. Build ONLY the files for this phase.\n\n" +
+    "Available tools:\n" +
+    "- run_scaffold: Run scaffold/init commands (npx create-next-app, django-admin, npm init, pip install, etc.).\n" +
+    "- batch_create_files: Create multiple files. Provide workspace_path and files array [{file_path, content}].\n" +
+    "- create_file: Create one file. Provide workspace_path, file_path, and content.\n" +
+    "- read_file: Read a file with line numbers.\n" +
+    "- insert_code: Insert code after a line number.\n" +
+    "- edit_file: Modify code via search/replace.\n" +
+    "- delete_code: Delete a function/class/endpoint block.\n" +
+    "- run_tests: Run a command (pytest, npm test, npm run build, etc.).\n\n" +
+    "CRITICAL RULES:\n" +
+    "1. Write COMPLETE file contents — never stubs or placeholders.\n" +
+    "2. If a file already exists and you need to modify it, use edit_file or insert_code — not create_file.\n" +
+    "3. Make files work with the existing codebase from previous phases.\n" +
+    "4. If the phase includes tests, run them after creating the files.\n" +
+    "5. Do NOT write unified diffs. The daemon handles that.\n" +
+    "6. Do NOT call github_create_repo, git_clone, or prepare_push_approval — those are handled externally.\n" +
+    "7. End with a concise summary of what you built in this phase.";
+
+const SYSTEM_PROMPT_PHASE_EVALUATE =
+    "You are a QA evaluator for a single build phase of a larger project. " +
+    "The phase had a specific goal and list of files to create. " +
+    "Based on the tool results below, determine: did the agent complete THIS phase?\n\n" +
+    "IMPORTANT: Only evaluate whether THIS phase's goals were met — not the overall project.\n" +
+    "If files were created successfully and any tests passed (or no tests were required), mark COMPLETE.\n\n" +
+    "Reply with EXACTLY one of:\n" +
+    "- COMPLETE: <one sentence summary>\n" +
+    "- INCOMPLETE: <what is still missing for THIS phase>\n" +
     "- FAILED: <what went wrong>";
 
 // ---------------------------------------------------------------------------
@@ -297,9 +392,10 @@ interface GenerateResult {
 async function runGenerate(
     messages: ModelMessage[],
     maxSteps: number,
+    overrideModel?: ReturnType<typeof openai>,
 ): Promise<GenerateResult> {
     const result = await generateText({
-        model,
+        model: overrideModel ?? model,
         messages,
         tools: aiTools,
         maxSteps,
@@ -355,7 +451,10 @@ async function processNormal(
     history: ModelMessage[],
 ): Promise<ProcessUserMessageResult> {
     const userMessage: ModelMessage = { role: "user", content: text };
-    const systemMessage: ModelMessage = { role: "system", content: SYSTEM_PROMPT_NORMAL };
+
+    const profile = await getUserProfile(senderId);
+    const profileSnippet = formatProfileForPrompt(profile);
+    const systemMessage: ModelMessage = { role: "system", content: SYSTEM_PROMPT_NORMAL + profileSnippet };
     const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
 
     let finalText = "I'm sorry, I wasn't able to generate a response.";
@@ -380,7 +479,109 @@ async function processNormal(
 // Dev-mode agentic orchestration (plan → execute → evaluate → retry)
 // ---------------------------------------------------------------------------
 
-const MAX_DEV_ATTEMPTS = 3;
+/** Base number of execute attempts for simple plans. Complex plans get more (see maxDevAttempts). */
+const MAX_DEV_ATTEMPTS_BASE = 5;
+const MAX_DEV_ATTEMPTS_CAP = 10;
+
+/** Dynamic max attempts: longer plans get more retries (e.g. create repo + clone + build + test + push). */
+function maxDevAttempts(planStepCount: number): number {
+    const steps = planStepCount || 1;
+    return Math.min(MAX_DEV_ATTEMPTS_CAP, Math.max(MAX_DEV_ATTEMPTS_BASE, steps + 2));
+}
+
+/**
+ * Extract all button actions from tool results.
+ */
+function extractButtonActions(
+    toolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }>,
+): string[] {
+    const actions: string[] = [];
+    for (const tr of toolResults) {
+        const value = tr.result ?? tr.output;
+        if (value && typeof value === "object" && "interactiveButtons" in (value as Record<string, unknown>)) {
+            const buttons = (value as Record<string, unknown>).interactiveButtons;
+            if (Array.isArray(buttons)) {
+                for (const b of buttons) {
+                    const action = (b as Record<string, unknown>).action;
+                    if (typeof action === "string") actions.push(action);
+                }
+            }
+        }
+    }
+    return actions;
+}
+
+/**
+ * Auto-apply all staged patches and auto-push found in tool results.
+ * Used by the dev agent so it doesn't stop for user approval on every edit.
+ */
+async function autoApplyAll(
+    toolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }>,
+): Promise<{ applied: number; pushed: boolean; errors: string[] }> {
+    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
+    if (!daemonUrl) return { applied: 0, pushed: false, errors: ["LOCAL_DAEMON_URL not configured"] };
+
+    const actions = extractButtonActions(toolResults);
+    let applied = 0;
+    let pushed = false;
+    const errors: string[] = [];
+
+    // Auto-apply patches
+    for (const action of actions) {
+        if (action.startsWith("apply_patch:")) {
+            const patchId = action.slice("apply_patch:".length);
+            try {
+                const staged = await getPendingPatch(patchId);
+                if (!staged) { errors.push(`Patch ${patchId} expired`); continue; }
+                const workspace = staged.workspace_path?.trim() || process.env.LOCAL_DAEMON_WORKSPACE_PATH?.trim();
+                if (!workspace) { errors.push(`No workspace for patch ${patchId}`); continue; }
+                const res = await fetch(`${daemonUrl}/apply-patch`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ patch_string: staged.patch_string, workspace_path: workspace }),
+                });
+                const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+                if (data.success) {
+                    applied++;
+                    console.info(`[orchestrator:dev] Auto-applied patch ${patchId}`);
+                } else {
+                    errors.push(`Patch ${patchId}: ${data.message ?? "failed"}`);
+                    console.warn(`[orchestrator:dev] Auto-apply failed for ${patchId}: ${data.message}`);
+                }
+            } catch (e) {
+                errors.push(`Patch ${patchId}: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+    }
+
+    // Auto-push (commit + push)
+    for (const action of actions) {
+        if (action.startsWith("push:")) {
+            const pushId = action.slice("push:".length);
+            try {
+                const staged = await getPendingPush(pushId);
+                if (!staged) { errors.push(`Push ${pushId} expired`); continue; }
+                const res = await fetch(`${daemonUrl}/git/commit-and-push`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ workspace_path: staged.workspace_path, commit_message: staged.commit_message }),
+                });
+                const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+                if (data.success) {
+                    pushed = true;
+                    console.info(`[orchestrator:dev] Auto-pushed ${pushId}`);
+                } else {
+                    errors.push(`Push: ${data.message ?? "failed"}`);
+                    console.warn(`[orchestrator:dev] Auto-push failed: ${data.message}`);
+                }
+            } catch (e) {
+                errors.push(`Push: ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+    }
+
+    return { applied, pushed, errors };
+}
 
 function summariseToolCalls(results: Array<{ result?: unknown; output?: unknown; toolName?: string }>): string {
     return results.map((tr) => {
@@ -406,6 +607,9 @@ async function processDev(
     const userMessage: ModelMessage = { role: "user", content: text };
     const job = await createJob(senderId, text);
 
+    const profile = await getUserProfile(senderId);
+    const profileSnippet = formatProfileForPrompt(profile);
+
     const progress = async (msg: string, jobUpdates?: Partial<DevJob>) => {
         if (jobUpdates) await updateJob(job.id, jobUpdates);
         if (onProgress) {
@@ -425,24 +629,25 @@ async function processDev(
     let planSteps: string[] = [];
     try {
         const planMessages: ModelMessage[] = [
-            { role: "system", content: SYSTEM_PROMPT_DEV_PLAN },
+            { role: "system", content: SYSTEM_PROMPT_DEV_PLAN + profileSnippet },
             ...history,
             userMessage,
         ];
         const planResult = await generateText({
-            model,
+            model: devModel,
             messages: planMessages,
         } as Parameters<typeof generateText>[0]);
         plan = (typeof planResult.text === "string" ? planResult.text.trim() : "") || "";
         planSteps = plan.split("\n").filter((l) => /^\d+[\.\)]/.test(l.trim()));
-        console.info(`[orchestrator:dev] Plan (${planSteps.length} steps):\n${plan}`);
+        console.info(`[orchestrator:dev] Plan (${planSteps.length} steps) [model=${MODEL_NAME_DEV}]:\n${plan}`);
     } catch (error) {
         console.error(`[orchestrator:dev] Planning failed:`, error);
     }
 
     const totalSteps = planSteps.length || 1;
+    const maxAttempts = maxDevAttempts(totalSteps);
     await progress(
-        `Plan ready (${totalSteps} step${totalSteps > 1 ? "s" : ""}):\n${planSteps.map((s) => s.trim()).join("\n") || "(executing directly)"}`,
+        `Plan ready (${totalSteps} step${totalSteps > 1 ? "s" : ""}, up to ${maxAttempts} attempts):\n${planSteps.map((s) => s.trim()).join("\n") || "(executing directly)"}`,
         { plan: planSteps, total_steps: totalSteps, status: "executing", current_action: "Starting execution..." },
     );
 
@@ -453,26 +658,35 @@ async function processDev(
     let toolResponse: StandardResponse | null = null;
     let attempt = 0;
     const filesCreated: string[] = [];
+    const allSuccessfulTools: string[] = [];
 
     const executeMessages: ModelMessage[] = [
         {
             role: "system",
-            content: SYSTEM_PROMPT_DEV_EXECUTE + (plan ? `\n\nPLAN:\n${plan}` : ""),
+            content: SYSTEM_PROMPT_DEV_EXECUTE + profileSnippet + (plan ? `\n\nPLAN:\n${plan}` : ""),
         },
         ...history,
         userMessage,
     ];
 
-    while (attempt < MAX_DEV_ATTEMPTS) {
+    while (attempt < maxAttempts) {
+        // Check for cancellation before each attempt
+        const currentJob = await getJob(job.id);
+        if (currentJob?.status === "cancelled") {
+            console.info(`[orchestrator:dev] Job ${job.id} was cancelled by user.`);
+            finalText = "Job cancelled.";
+            break;
+        }
+
         attempt++;
-        console.info(`[orchestrator:dev] Phase 2 — Execute attempt ${attempt}/${MAX_DEV_ATTEMPTS} for sender="${senderId}"`);
+        console.info(`[orchestrator:dev] Phase 2 — Execute attempt ${attempt}/${maxAttempts} for sender="${senderId}"`);
         await progress(
-            `Executing (attempt ${attempt}/${MAX_DEV_ATTEMPTS})...`,
+            `Executing (attempt ${attempt}/${maxAttempts})...`,
             { current_step: attempt, current_action: `Executing (attempt ${attempt})` },
         );
 
         try {
-            const result = await runGenerate(executeMessages, 15);
+            const result = await runGenerate(executeMessages, 25, devModel);
 
             if (result.text) finalText = result.text;
             if (result.toolResponse) toolResponse = result.toolResponse;
@@ -496,88 +710,149 @@ async function processDev(
                 }
             }
 
-            if (result.hasApproveButton) {
-                console.info(`[orchestrator:dev] Got Approve & Apply button on attempt ${attempt}.`);
-                await progress(
-                    "Changes ready for approval.",
-                    { status: "complete", current_action: "Awaiting approval", files_created: filesCreated, finished_at: Date.now() },
-                );
-                break;
+            // Auto-apply patches and auto-push during dev mode
+            const buttonActions = extractButtonActions(result.allToolResults);
+            if (buttonActions.length > 0) {
+                console.info(`[orchestrator:dev] Auto-applying ${buttonActions.length} action(s) from attempt ${attempt}...`);
+                const autoResult = await autoApplyAll(result.allToolResults);
+                if (autoResult.applied > 0) {
+                    await progress(`Auto-applied ${autoResult.applied} patch(es).`);
+                }
+                if (autoResult.pushed) {
+                    await progress("Auto-pushed to GitHub.", { status: "complete", current_action: "Pushed", finished_at: Date.now() });
+                    // Push is the final step — task is done
+                    break;
+                }
+                if (autoResult.errors.length > 0) {
+                    console.warn(`[orchestrator:dev] Auto-apply errors: ${autoResult.errors.join("; ")}`);
+                }
+                // Continue to evaluate — more steps may remain
             }
 
             // ---------------------------------------------------------------
-            // Phase 3: Evaluate — did the agent complete the task?
+            // Phase 3: Evaluate — runs on EVERY attempt (including last)
             // ---------------------------------------------------------------
-            if (attempt < MAX_DEV_ATTEMPTS) {
-                console.info(`[orchestrator:dev] Phase 3 — Evaluating attempt ${attempt}`);
-                await progress("Evaluating progress...", { current_action: "Evaluating..." });
+            console.info(`[orchestrator:dev] Phase 3 — Evaluating attempt ${attempt}`);
+            await progress("Evaluating progress...", { current_action: "Evaluating..." });
 
-                const toolSummary = summariseToolCalls(result.allToolResults);
+            const toolSummary = summariseToolCalls(result.allToolResults);
 
-                try {
-                    const evalMessages: ModelMessage[] = [
-                        { role: "system", content: SYSTEM_PROMPT_DEV_EVALUATE },
-                        {
-                            role: "user",
-                            content:
-                                `User request: "${text}"\n\n` +
-                                `Agent's text response: "${finalText}"\n\n` +
-                                `Tool calls and results:\n${toolSummary || "(none)"}`,
-                        },
-                    ];
-                    const evalResult = await generateText({
-                        model,
-                        messages: evalMessages,
-                    } as Parameters<typeof generateText>[0]);
-                    const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
-                    console.info(`[orchestrator:dev] Evaluation verdict: ${verdict}`);
-
-                    if (verdict.startsWith("COMPLETE")) {
-                        await progress(
-                            "Task complete.",
-                            { status: "complete", current_action: "Done", files_created: filesCreated, finished_at: Date.now() },
-                        );
-                        break;
-                    }
-
-                    const nudge = verdict.startsWith("INCOMPLETE")
-                        ? verdict.replace(/^INCOMPLETE:\s*/, "")
-                        : verdict.startsWith("FAILED")
-                          ? `The previous attempt failed: ${verdict.replace(/^FAILED:\s*/, "")}. Try a different approach.`
-                          : "The task is not complete. Continue executing the plan.";
-
-                    await progress(`Retrying: ${nudge.slice(0, 120)}`, { errors: [nudge] });
-
-                    executeMessages.push(
-                        { role: "assistant", content: finalText || "(no text)" },
-                        { role: "user", content: `[SYSTEM] ${nudge}` },
-                    );
-                } catch (evalError) {
-                    console.error(`[orchestrator:dev] Evaluation failed:`, evalError);
-                    await progress("Evaluation failed, retrying...");
-                    executeMessages.push(
-                        { role: "assistant", content: finalText || "(no text)" },
-                        {
-                            role: "user",
-                            content: "[SYSTEM] The task is not complete. You stopped after reading or searching. You MUST call insert_code, edit_file, delete_code, or create_file to make the change. Continue.",
-                        },
-                    );
+            // Accumulate successful tool calls across ALL attempts
+            for (const tr of result.allToolResults) {
+                const val = tr.result ?? tr.output;
+                const isSuccess = val && typeof val === "object"
+                    && "success" in (val as Record<string, unknown>)
+                    && (val as Record<string, unknown>).success === true;
+                if (isSuccess || (val != null && tr.toolName)) {
+                    const name = tr.toolName ?? "unknown";
+                    const preview = typeof val === "object" && val !== null
+                        ? JSON.stringify(val).slice(0, 300)
+                        : String(val ?? "").slice(0, 300);
+                    allSuccessfulTools.push(`${name}: ${preview}`);
                 }
+            }
+
+            try {
+                const evalMessages: ModelMessage[] = [
+                    { role: "system", content: SYSTEM_PROMPT_DEV_EVALUATE },
+                    {
+                        role: "user",
+                        content:
+                            `User request: "${text}"\n\n` +
+                            `Agent's text response: "${finalText}"\n\n` +
+                            `Tool calls and results (attempt ${attempt}):\n${toolSummary || "(none)"}` +
+                            (allSuccessfulTools.length > 0
+                                ? `\n\nAll successful operations across all attempts:\n${allSuccessfulTools.join("\n")}`
+                                : ""),
+                    },
+                ];
+                const evalResult = await generateText({
+                    model: devModel,
+                    messages: evalMessages,
+                } as Parameters<typeof generateText>[0]);
+                const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
+                console.info(`[orchestrator:dev] Evaluation verdict: ${verdict}`);
+
+                if (verdict.startsWith("COMPLETE")) {
+                    await progress(
+                        "Task complete.",
+                        { status: "complete", current_action: "Done", files_created: filesCreated, finished_at: Date.now() },
+                    );
+                    break;
+                }
+
+                if (attempt >= maxAttempts) {
+                    // Last attempt — no more retries
+                    await progress(
+                        `Could not complete after ${attempt} attempts.`,
+                        { status: "failed", finished_at: Date.now() },
+                    );
+                    break;
+                }
+
+                const missing = verdict.startsWith("INCOMPLETE")
+                    ? verdict.replace(/^INCOMPLETE:\s*/, "")
+                    : verdict.startsWith("FAILED")
+                      ? verdict.replace(/^FAILED:\s*/, "")
+                      : "The task is not complete.";
+
+                const alreadyDone = allSuccessfulTools.length > 0
+                    ? `\n\nALREADY COMPLETED (do NOT repeat these — they are DONE):\n${allSuccessfulTools.join("\n")}`
+                    : "";
+
+                const nudge =
+                    `Continue from where you left off. Do NOT repeat steps that already succeeded.` +
+                    ` If github_create_repo or git_clone already returned success, skip them entirely and move on.${alreadyDone}\n\n` +
+                    `WHAT STILL NEEDS TO BE DONE: ${missing}`;
+
+                await progress(`Retrying: ${missing.slice(0, 120)}`, { errors: [missing] });
+
+                executeMessages.push(
+                    { role: "assistant", content: finalText || "(no text)" },
+                    { role: "user", content: `[SYSTEM] ${nudge}` },
+                );
+            } catch (evalError) {
+                console.error(`[orchestrator:dev] Evaluation failed:`, evalError);
+
+                if (attempt >= maxAttempts) {
+                    await progress(
+                        `Failed after ${attempt} attempts (evaluation error).`,
+                        { status: "failed", finished_at: Date.now() },
+                    );
+                    break;
+                }
+
+                await progress("Evaluation failed, retrying...");
+
+                const alreadyDone = allSuccessfulTools.length > 0
+                    ? `\nALREADY COMPLETED (do NOT repeat):\n${allSuccessfulTools.join("\n")}\n\n`
+                    : "";
+
+                executeMessages.push(
+                    { role: "assistant", content: finalText || "(no text)" },
+                    {
+                        role: "user",
+                        content: `[SYSTEM] The task is not complete. ${alreadyDone}Continue from where you left off. Do NOT re-create repos or re-clone. Call the next action tool (batch_create_files, run_tests, prepare_push_approval).`,
+                    },
+                );
             }
         } catch (error) {
             console.error(`[orchestrator:dev] Execute attempt ${attempt} failed:`, error);
             const errMsg = error instanceof Error ? error.message : String(error);
-            if (attempt >= MAX_DEV_ATTEMPTS) {
+            if (attempt >= maxAttempts) {
                 finalText = "I ran into an error while working on your request. Please try again.";
                 await progress(
                     `Failed after ${attempt} attempts: ${errMsg.slice(0, 120)}`,
                     { status: "failed", errors: [errMsg], finished_at: Date.now() },
                 );
             } else {
+                const alreadyDone = allSuccessfulTools.length > 0
+                    ? `\nALREADY COMPLETED (do NOT repeat):\n${allSuccessfulTools.join("\n")}\n\n`
+                    : "";
                 await progress(`Attempt ${attempt} errored, retrying...`, { errors: [errMsg] });
                 executeMessages.push(
                     { role: "assistant", content: "(error occurred)" },
-                    { role: "user", content: "[SYSTEM] The previous attempt hit an error. Try again with a different approach." },
+                    { role: "user", content: `[SYSTEM] The previous attempt hit an error: ${errMsg.slice(0, 200)}. ${alreadyDone}Skip already-completed steps and continue with the NEXT step.` },
                 );
             }
         }
@@ -591,6 +866,441 @@ async function processDev(
     await saveChatMessages(senderId, [userMessage, assistantMessage]);
 
     return { response: toolResponse ?? { text: finalText } };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-phase dev orchestration
+// ---------------------------------------------------------------------------
+
+const MAX_PHASE_ATTEMPTS = 3;
+const daemonUrl = () => process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
+
+interface DecomposedProject {
+    project_name: string;
+    scaffold_command?: string;
+    phases: Array<{ name: string; description: string; files: string[] }>;
+}
+
+async function commitPhase(workspacePath: string, message: string): Promise<{ success: boolean; error?: string }> {
+    try {
+        const res = await fetch(`${daemonUrl()}/git/commit-all`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspace_path: workspacePath, commit_message: message }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+        return { success: data.success === true, error: data.message };
+    } catch (e) {
+        return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
+}
+
+async function pushRepo(workspacePath: string, commitMessage: string): Promise<{ success: boolean; error?: string }> {
+    try {
+        const res = await fetch(`${daemonUrl()}/git/commit-and-push`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspace_path: workspacePath, commit_message: commitMessage }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+        return { success: data.success === true, error: data.message };
+    } catch (e) {
+        return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
+}
+
+async function executePhase(
+    phase: DecomposedProject["phases"][number],
+    phaseIndex: number,
+    totalPhases: number,
+    workspacePath: string,
+    existingFiles: string[],
+    history: ModelMessage[],
+    onProgress?: ProgressCallback,
+): Promise<{ success: boolean; text: string; filesCreated: string[] }> {
+    const phaseLabel = `[Phase ${phaseIndex + 1}/${totalPhases}: ${phase.name}]`;
+    const filesCreated: string[] = [];
+
+    const phaseContext =
+        `${phaseLabel}\n` +
+        `Workspace: ${workspacePath}\n` +
+        `Phase goal: ${phase.description}\n` +
+        `Files to create/modify: ${phase.files.join(", ")}\n` +
+        (existingFiles.length > 0
+            ? `Files already in the project from previous phases:\n${existingFiles.join("\n")}\n`
+            : "This is the first content phase — no existing files yet.\n");
+
+    const executeMessages: ModelMessage[] = [
+        { role: "system", content: SYSTEM_PROMPT_PHASE_EXECUTE + "\n\n" + phaseContext },
+        ...history.slice(-4),
+        { role: "user", content: `Build this phase: ${phase.description}\n\nFiles: ${phase.files.join(", ")}` },
+    ];
+
+    let finalText = "";
+    let attempt = 0;
+    const allSuccessfulTools: string[] = [];
+
+    while (attempt < MAX_PHASE_ATTEMPTS) {
+        attempt++;
+        if (onProgress) {
+            try { await onProgress(`${phaseLabel} Executing (attempt ${attempt}/${MAX_PHASE_ATTEMPTS})...`); } catch {}
+        }
+
+        try {
+            const result = await runGenerate(executeMessages, 25, devModel);
+            if (result.text) finalText = result.text;
+
+            // Track created files
+            for (const tr of result.allToolResults) {
+                if (tr.toolName === "create_file" || tr.toolName === "batch_create_files") {
+                    const val = tr.result ?? tr.output;
+                    if (val && typeof val === "object") {
+                        if ("path" in (val as Record<string, unknown>)) {
+                            filesCreated.push(String((val as Record<string, unknown>).path));
+                        }
+                        if ("results" in (val as Record<string, unknown>)) {
+                            const results = (val as Record<string, unknown>).results as Array<{ file_path?: string; success?: boolean }> | undefined;
+                            if (results) {
+                                for (const r of results) {
+                                    if (r.success && r.file_path) filesCreated.push(r.file_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Auto-apply any patches generated during this phase
+            const buttonActions = extractButtonActions(result.allToolResults);
+            if (buttonActions.length > 0) {
+                const autoResult = await autoApplyAll(result.allToolResults);
+                if (autoResult.applied > 0 && onProgress) {
+                    try { await onProgress(`${phaseLabel} Auto-applied ${autoResult.applied} patch(es).`); } catch {}
+                }
+            }
+
+            // Accumulate successful tools
+            for (const tr of result.allToolResults) {
+                const val = tr.result ?? tr.output;
+                const isSuccess = val && typeof val === "object"
+                    && "success" in (val as Record<string, unknown>)
+                    && (val as Record<string, unknown>).success === true;
+                if (isSuccess || (val != null && tr.toolName)) {
+                    const name = tr.toolName ?? "unknown";
+                    const preview = typeof val === "object" && val !== null
+                        ? JSON.stringify(val).slice(0, 200)
+                        : String(val ?? "").slice(0, 200);
+                    allSuccessfulTools.push(`${name}: ${preview}`);
+                }
+            }
+
+            // Evaluate this phase
+            const toolSummary = summariseToolCalls(result.allToolResults);
+            try {
+                const evalMessages: ModelMessage[] = [
+                    { role: "system", content: SYSTEM_PROMPT_PHASE_EVALUATE },
+                    {
+                        role: "user",
+                        content:
+                            `Phase: "${phase.name}"\nGoal: ${phase.description}\nExpected files: ${phase.files.join(", ")}\n\n` +
+                            `Agent response: "${finalText}"\n\nTool results:\n${toolSummary || "(none)"}`,
+                    },
+                ];
+                const evalResult = await generateText({
+                    model: devModel,
+                    messages: evalMessages,
+                } as Parameters<typeof generateText>[0]);
+                const verdict = (typeof evalResult.text === "string" ? evalResult.text.trim() : "") || "";
+                console.info(`[orchestrator:phase] ${phaseLabel} Eval: ${verdict}`);
+
+                if (verdict.startsWith("COMPLETE")) {
+                    return { success: true, text: finalText, filesCreated };
+                }
+
+                if (attempt >= MAX_PHASE_ATTEMPTS) {
+                    return { success: false, text: `Phase "${phase.name}" incomplete after ${attempt} attempts: ${verdict}`, filesCreated };
+                }
+
+                const missing = verdict.replace(/^(INCOMPLETE|FAILED):\s*/, "");
+                const alreadyDone = allSuccessfulTools.length > 0
+                    ? `\n\nALREADY DONE (do NOT repeat):\n${allSuccessfulTools.join("\n")}`
+                    : "";
+
+                executeMessages.push(
+                    { role: "assistant", content: finalText || "(no text)" },
+                    { role: "user", content: `[SYSTEM] Phase not complete. Continue.${alreadyDone}\n\nSTILL NEEDED: ${missing}` },
+                );
+            } catch {
+                if (attempt >= MAX_PHASE_ATTEMPTS) {
+                    return { success: true, text: finalText, filesCreated };
+                }
+            }
+        } catch (error) {
+            console.error(`[orchestrator:phase] ${phaseLabel} attempt ${attempt} error:`, error);
+            if (attempt >= MAX_PHASE_ATTEMPTS) {
+                return { success: false, text: `Phase "${phase.name}" failed: ${error instanceof Error ? error.message : String(error)}`, filesCreated };
+            }
+            executeMessages.push(
+                { role: "assistant", content: "(error)" },
+                { role: "user", content: "[SYSTEM] Error occurred. Try again." },
+            );
+        }
+    }
+
+    return { success: false, text: finalText || `Phase "${phase.name}" did not complete.`, filesCreated };
+}
+
+async function processDevMultiPhase(
+    senderId: string,
+    text: string,
+    history: ModelMessage[],
+    onProgress?: ProgressCallback,
+): Promise<ProcessUserMessageResult> {
+    const userMessage: ModelMessage = { role: "user", content: text };
+    const job = await createJob(senderId, text);
+
+    const profile = await getUserProfile(senderId);
+    const profileSnippet = formatProfileForPrompt(profile);
+
+    const progress = async (msg: string, jobUpdates?: Partial<DevJob>) => {
+        if (jobUpdates) await updateJob(job.id, jobUpdates);
+        if (onProgress) {
+            try { await onProgress(msg); } catch (e) {
+                console.error(`[orchestrator:multi] onProgress error:`, e);
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // Phase 0: Decompose the project into phases
+    // -----------------------------------------------------------------------
+    console.info(`[orchestrator:multi] Decomposing project for sender="${senderId}"`);
+    await progress("Analyzing project structure...", { status: "planning", current_action: "Decomposing project..." });
+
+    let decomposed: DecomposedProject;
+    try {
+        const decomposeMessages: ModelMessage[] = [
+            { role: "system", content: SYSTEM_PROMPT_DEV_DECOMPOSE + profileSnippet },
+            ...history,
+            userMessage,
+        ];
+        const decomposeResult = await generateText({
+            model: devModel,
+            messages: decomposeMessages,
+        } as Parameters<typeof generateText>[0]);
+        const rawText = (typeof decomposeResult.text === "string" ? decomposeResult.text.trim() : "") || "{}";
+
+        // Strip markdown fences if present
+        const jsonText = rawText.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+        decomposed = JSON.parse(jsonText) as DecomposedProject;
+
+        if (!decomposed.phases || decomposed.phases.length === 0) {
+            throw new Error("Decomposer returned no phases");
+        }
+    } catch (error) {
+        console.error(`[orchestrator:multi] Decompose failed, falling back to single-phase:`, error);
+        await clearActiveJob(senderId);
+        return processDev(senderId, text, history, onProgress);
+    }
+
+    const phases = decomposed.phases;
+    const totalPhases = phases.length;
+    const projectName = decomposed.project_name || "project";
+
+    const jobPhases: DevJobPhase[] = phases.map((p) => ({
+        name: p.name,
+        description: p.description,
+        files: p.files,
+        status: "pending" as const,
+    }));
+
+    console.info(`[orchestrator:multi] Decomposed into ${totalPhases} phases [model=${MODEL_NAME_DEV}]`);
+    await progress(
+        `Project decomposed into ${totalPhases} phases:\n${phases.map((p, i) => `${i + 1}. ${p.name}: ${p.description}`).join("\n")}`,
+        { status: "executing", phases: jobPhases, total_phases: totalPhases, current_phase: 0 },
+    );
+
+    // -----------------------------------------------------------------------
+    // Setup: Create repo + clone
+    // -----------------------------------------------------------------------
+    console.info(`[orchestrator:multi] Running setup: create repo + clone`);
+    await progress("Setting up repository...", { current_action: "Creating repo...", current_phase: 0 });
+
+    let workspacePath = "";
+    let repoUrl = "";
+
+    // Create the GitHub repo
+    try {
+        const setupMessages: ModelMessage[] = [
+            {
+                role: "system",
+                content: SYSTEM_PROMPT_DEV_EXECUTE + `\n\nPLAN:\n1. github_create_repo(name="${projectName}")\n2. git_clone(clone_url=<from step 1>)`,
+            },
+            userMessage,
+        ];
+        const setupResult = await runGenerate(setupMessages, 10, devModel);
+
+        // Extract workspace_path and repo URL from tool results
+        for (const tr of setupResult.allToolResults) {
+            const val = (tr.result ?? tr.output) as Record<string, unknown> | undefined;
+            if (!val || typeof val !== "object") continue;
+            if (val.local_path && typeof val.local_path === "string") {
+                workspacePath = val.local_path;
+            }
+            if (val.html_url && typeof val.html_url === "string") {
+                repoUrl = val.html_url;
+            }
+            if (val.clone_url && typeof val.clone_url === "string" && !workspacePath) {
+                // If we got clone_url but not local_path yet, the clone step may come next
+            }
+        }
+
+        if (!workspacePath) {
+            // Fallback: construct from default workspace + project name
+            const defaultWs = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "C:/Users/madus/Desktop";
+            workspacePath = `${defaultWs}/${projectName}`;
+            console.warn(`[orchestrator:multi] Could not extract workspace_path from setup, using fallback: ${workspacePath}`);
+        }
+
+        console.info(`[orchestrator:multi] Repo ready at: ${workspacePath} (URL: ${repoUrl})`);
+        await progress(`Repository ready: ${repoUrl || projectName}`, { current_action: "Repo created" });
+    } catch (error) {
+        console.error(`[orchestrator:multi] Setup failed:`, error);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        await progress(`Setup failed: ${errMsg}`, { status: "failed", errors: [errMsg], finished_at: Date.now() });
+        await clearActiveJob(senderId);
+        return { response: { text: `Failed to set up repository: ${errMsg}` } };
+    }
+
+    // Run scaffold command if specified
+    if (decomposed.scaffold_command) {
+        await progress(`Running scaffold: ${decomposed.scaffold_command}...`, { current_action: "Scaffolding..." });
+        try {
+            const scaffoldMessages: ModelMessage[] = [
+                {
+                    role: "system",
+                    content: `You are a dev agent. Run this scaffold command and nothing else.\n\nAvailable tools:\n- run_scaffold: Run a scaffold command.\n- run_tests: Run install commands.\n\nRun the command, then stop.`,
+                },
+                { role: "user", content: `Run this scaffold command in workspace "${workspacePath}": ${decomposed.scaffold_command}` },
+            ];
+            const scaffoldResult = await runGenerate(scaffoldMessages, 5, devModel);
+            console.info(`[orchestrator:multi] Scaffold complete: ${scaffoldResult.text?.slice(0, 100)}`);
+            await progress("Scaffold complete.");
+
+            // Commit scaffold
+            const commitResult = await commitPhase(workspacePath, `chore: scaffold ${projectName}`);
+            if (commitResult.success) {
+                console.info(`[orchestrator:multi] Scaffold committed.`);
+            }
+        } catch (error) {
+            console.warn(`[orchestrator:multi] Scaffold command failed (continuing):`, error);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Execute each phase
+    // -----------------------------------------------------------------------
+    const allFilesCreated: string[] = [];
+    const phaseSummaries: string[] = [];
+    let lastPhaseSucceeded = true;
+
+    for (let i = 0; i < phases.length; i++) {
+        // Check cancellation
+        const currentJob = await getJob(job.id);
+        if (currentJob?.status === "cancelled") {
+            console.info(`[orchestrator:multi] Job cancelled by user at phase ${i + 1}.`);
+            break;
+        }
+
+        const phase = phases[i];
+        const phaseNum = i + 1;
+
+        // Update job state
+        jobPhases[i].status = "executing";
+        await progress(
+            `Building phase ${phaseNum}/${totalPhases}: ${phase.name}...`,
+            { current_phase: phaseNum, current_action: `Phase ${phaseNum}: ${phase.name}`, phases: jobPhases },
+        );
+
+        console.info(`[orchestrator:multi] Starting phase ${phaseNum}/${totalPhases}: ${phase.name}`);
+
+        const phaseResult = await executePhase(
+            phase,
+            i,
+            totalPhases,
+            workspacePath,
+            allFilesCreated,
+            history,
+            onProgress,
+        );
+
+        if (phaseResult.success) {
+            jobPhases[i].status = "complete";
+            allFilesCreated.push(...phaseResult.filesCreated);
+            phaseSummaries.push(`Phase ${phaseNum} (${phase.name}): Done`);
+
+            // Commit after each successful phase
+            const commitResult = await commitPhase(workspacePath, `feat: ${phase.name.toLowerCase()}`);
+            if (commitResult.success) {
+                console.info(`[orchestrator:multi] Phase ${phaseNum} committed.`);
+            } else {
+                console.warn(`[orchestrator:multi] Phase ${phaseNum} commit failed: ${commitResult.error}`);
+            }
+
+            await progress(`Phase ${phaseNum}/${totalPhases} complete: ${phase.name}`);
+        } else {
+            jobPhases[i].status = "failed";
+            phaseSummaries.push(`Phase ${phaseNum} (${phase.name}): Failed — ${phaseResult.text.slice(0, 100)}`);
+            lastPhaseSucceeded = false;
+
+            // Still commit whatever was created, then continue
+            await commitPhase(workspacePath, `wip: partial ${phase.name.toLowerCase()}`);
+            await progress(`Phase ${phaseNum} had issues but continuing: ${phaseResult.text.slice(0, 80)}`);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Final push
+    // -----------------------------------------------------------------------
+    await progress("Pushing to GitHub...", { current_action: "Pushing..." });
+    const pushResult = await pushRepo(workspacePath, `feat: complete ${projectName}`);
+
+    let finalText: string;
+    if (pushResult.success) {
+        const completedCount = jobPhases.filter((p) => p.status === "complete").length;
+        finalText =
+            `Project "${projectName}" built and pushed!\n\n` +
+            `Phases completed: ${completedCount}/${totalPhases}\n` +
+            phaseSummaries.join("\n") +
+            (repoUrl ? `\n\nRepo: ${repoUrl}` : "") +
+            (allFilesCreated.length > 0 ? `\n\nFiles created: ${allFilesCreated.length}` : "");
+
+        await progress("Done! Project pushed to GitHub.", {
+            status: "complete",
+            current_action: "Done",
+            files_created: allFilesCreated,
+            phases: jobPhases,
+            finished_at: Date.now(),
+        });
+    } else {
+        finalText =
+            `Project "${projectName}" was built but push failed: ${pushResult.error}\n\n` +
+            phaseSummaries.join("\n") +
+            (repoUrl ? `\n\nRepo: ${repoUrl}` : "");
+
+        await progress(`Build complete but push failed: ${pushResult.error}`, {
+            status: "failed",
+            errors: [pushResult.error ?? "Push failed"],
+            phases: jobPhases,
+            finished_at: Date.now(),
+        });
+    }
+
+    await clearActiveJob(senderId);
+    const assistantMessage: ModelMessage = { role: "assistant", content: finalText };
+    await saveChatMessages(senderId, [userMessage, assistantMessage]);
+
+    return { response: { text: finalText } };
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +1322,21 @@ export async function processUserMessage(
     const history: ModelMessage[] = await getChatHistory(senderId);
 
     if (options?.devMode) {
+        // Use multi-phase for requests that sound like building a full project
+        const lowerText = text.toLowerCase();
+        const isLargeProject =
+            (lowerText.includes("build") || lowerText.includes("create")) &&
+            (lowerText.includes("website") || lowerText.includes("web app") ||
+             lowerText.includes("application") || lowerText.includes("full") ||
+             lowerText.includes("e-commerce") || lowerText.includes("shopping") ||
+             lowerText.includes("dashboard") || lowerText.includes("platform") ||
+             lowerText.includes("multi-page") || lowerText.includes("full-stack"));
+
+        if (isLargeProject) {
+            console.info(`[orchestrator] Using multi-phase flow for sender="${senderId}"`);
+            return processDevMultiPhase(senderId, text, history, options.onProgress);
+        }
+
         return processDev(senderId, text, history, options.onProgress);
     }
     return processNormal(senderId, text, history);

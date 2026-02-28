@@ -414,6 +414,13 @@ export async function getPendingPushOnly(pushOnlyId: string): Promise<StagedPush
 // Job manager (dev-agent job tracking)
 // ---------------------------------------------------------------------------
 
+export interface DevJobPhase {
+    name: string;
+    description: string;
+    files: string[];
+    status: "pending" | "executing" | "complete" | "failed";
+}
+
 export interface DevJob {
     id: string;
     sender_id: string;
@@ -428,6 +435,10 @@ export interface DevJob {
     files_created: string[];
     started_at: number;
     finished_at?: number;
+    /** Multi-phase fields */
+    phases?: DevJobPhase[];
+    current_phase?: number;
+    total_phases?: number;
 }
 
 export async function createJob(senderId: string, goal: string): Promise<DevJob> {
@@ -496,5 +507,57 @@ export async function clearActiveJob(senderId: string): Promise<void> {
         await getRedisClient().del(activeJobKey(senderId));
     } catch (error) {
         console.error(`[redis] clearActiveJob failed:`, error instanceof Error ? error.message : error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active research job (for status/cancel while research runs in background)
+// ---------------------------------------------------------------------------
+
+export interface ActiveResearch {
+    topic: string;
+    started_at: number;
+    cancelled?: boolean;
+}
+
+const activeResearchKey = (senderId: string): string => `activeresearch:${senderId}`;
+
+export async function setActiveResearch(senderId: string, topic: string): Promise<void> {
+    try {
+        const data: ActiveResearch = { topic, started_at: Date.now() };
+        await getRedisClient().set(activeResearchKey(senderId), JSON.stringify(data), { ex: JOB_TTL_SECONDS });
+    } catch (error) {
+        console.error(`[redis] setActiveResearch failed:`, error instanceof Error ? error.message : error);
+    }
+}
+
+export async function getActiveResearch(senderId: string): Promise<ActiveResearch | null> {
+    try {
+        const raw = await getRedisClient().get<string>(activeResearchKey(senderId));
+        if (!raw) return null;
+        return JSON.parse(raw) as ActiveResearch;
+    } catch (error) {
+        console.error(`[redis] getActiveResearch failed:`, error instanceof Error ? error.message : error);
+        return null;
+    }
+}
+
+export async function clearActiveResearch(senderId: string): Promise<void> {
+    try {
+        await getRedisClient().del(activeResearchKey(senderId));
+    } catch (error) {
+        console.error(`[redis] clearActiveResearch failed:`, error instanceof Error ? error.message : error);
+    }
+}
+
+export async function setResearchCancelled(senderId: string): Promise<void> {
+    try {
+        const existing = await getActiveResearch(senderId);
+        if (existing) {
+            existing.cancelled = true;
+            await getRedisClient().set(activeResearchKey(senderId), JSON.stringify(existing), { ex: JOB_TTL_SECONDS });
+        }
+    } catch (error) {
+        console.error(`[redis] setResearchCancelled failed:`, error instanceof Error ? error.message : error);
     }
 }

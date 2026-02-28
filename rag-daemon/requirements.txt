@@ -23,3 +23,5 @@ sentence-transformers>=3.0.0,<4.0.0  # Local embedding models (all-MiniLM-L6-v2)
 # --- Utilities -----------------------------------------------------------
 python-dotenv>=1.0.0,<2.0.0        # .env file support (used by pydantic-settings)
 requests>=2.31.0,<3.0.0            # HTTP client for Spotify Web API
+markdown>=3.5.0,<4.0.0             # Markdown to HTML for research PDF
+xhtml2pdf>=0.2.13,<0.3.0           # HTML to PDF (pure Python)

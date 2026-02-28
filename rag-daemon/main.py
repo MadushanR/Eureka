@@ -47,9 +47,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Literal
 
 import chromadb
+import markdown
+from xhtml2pdf import pisa
 from chromadb import Settings as ChromaSettings
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -439,29 +442,61 @@ class ReadFileResponse(BaseModel):
 
 # Allowed command lines for /run-command (normalized to single spaces, lowercased for comparison).
 # Only these exact commands are permitted to avoid shell injection.
+# Exact-match commands
 RUN_COMMAND_WHITELIST = frozenset({
     "npm test",
     "npm run test",
     "yarn test",
     "pnpm test",
     "pnpm run test",
-    "pytest",
-    "python -m pytest",
     "dotnet test",
     "npm install",
     "npm ci",
     "yarn install",
     "pnpm install",
-    "pip install -r requirements.txt",
     "npm run build",
     "yarn build",
     "pnpm build",
     "npm run lint",
     "yarn lint",
     "pnpm lint",
-    "python -m py_compile",
     "npx tsc --noEmit",
 })
+
+# Prefix-match: command is allowed if it starts with any of these.
+# Lets the LLM pass flags like `pytest -q`, `pip install pytest`, etc.
+RUN_COMMAND_PREFIX_WHITELIST = (
+    "pytest",
+    "python -m pytest",
+    "pip install",
+    "python -m py_compile",
+)
+
+# ---------------------------------------------------------------------------
+# Scaffold command whitelist — for project initialization only
+# ---------------------------------------------------------------------------
+RUN_SCAFFOLD_PREFIX_WHITELIST = (
+    "npx create-next-app",
+    "npx create-react-app",
+    "npx create-vite",
+    "django-admin startproject",
+    "django-admin startapp",
+    "npm init",
+    "yarn init",
+    "pnpm init",
+    "pnpm create",
+    "python -m venv",
+    "python -m flask",
+    "pip install",
+    "git init",
+)
+
+
+def _is_scaffold_allowed(normalized: str) -> bool:
+    for prefix in RUN_SCAFFOLD_PREFIX_WHITELIST:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            return True
+    return False
 
 
 class RunCommandRequest(BaseModel):
@@ -608,6 +643,55 @@ class PushResponse(BaseModel):
     stdout: str = ""
     stderr: str = ""
     started: bool = False  # True when push is running in background (202 response)
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo creation models
+# ---------------------------------------------------------------------------
+
+class GitHubCreateRepoRequest(BaseModel):
+    """Payload for /github/create-repo."""
+    name: str = Field(..., min_length=1, max_length=100, description="Repository name (e.g. 'my-todo-app').")
+    description: str = Field(default="", description="Short repo description.")
+    private: bool = Field(default=False, description="Whether the repo should be private.")
+
+    @field_validator("name")
+    @classmethod
+    def _validate_repo_name(cls, v: str) -> str:
+        import re
+        v = v.strip()
+        if not re.match(r"^[a-zA-Z0-9._-]+$", v):
+            raise ValueError("Repo name may only contain letters, numbers, dots, hyphens, and underscores.")
+        return v
+
+
+class GitHubCreateRepoResponse(BaseModel):
+    success: bool
+    message: str = ""
+    html_url: str = ""
+    clone_url: str = ""
+    name: str = ""
+
+
+class GitCloneRequest(BaseModel):
+    """Payload for /git/clone."""
+    clone_url: str = Field(..., min_length=1, description="HTTPS clone URL (must start with https://github.com/).")
+    parent_directory: str = Field(..., min_length=1, description="Absolute path to the parent directory (must be in ALLOWED_WORKSPACES).")
+    folder_name: Optional[str] = Field(default=None, description="Override the folder name. Defaults to the repo name from the URL.")
+
+    @field_validator("clone_url")
+    @classmethod
+    def _validate_clone_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith("https://github.com/"):
+            raise ValueError("Only https://github.com/ clone URLs are supported.")
+        return v
+
+
+class GitCloneResponse(BaseModel):
+    success: bool
+    message: str = ""
+    local_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1096,8 @@ def _git_commit_and_push_sync(workspace_path: str, commit_message: str) -> tuple
             if "nothing to commit" in (commit_result.stdout or "") + (commit_result.stderr or ""):
                 return False, "Nothing to commit (working tree clean).", commit_result.stdout or "", commit_result.stderr or ""
             return False, "git commit failed.", commit_result.stdout or "", commit_result.stderr or ""
+        # Try normal push first; if it fails (e.g. empty repo, no upstream),
+        # retry with -u origin HEAD to set the upstream branch.
         push_result = subprocess.run(
             ["git", "push"],
             cwd=resolved,
@@ -1019,6 +1105,14 @@ def _git_commit_and_push_sync(workspace_path: str, commit_message: str) -> tuple
             text=True,
             timeout=60,
         )
+        if push_result.returncode != 0:
+            push_result = subprocess.run(
+                ["git", "push", "-u", "origin", "HEAD"],
+                cwd=resolved,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
         if push_result.returncode != 0:
             return False, "git push failed.", push_result.stdout or "", push_result.stderr or ""
         return True, "Committed and pushed successfully.", push_result.stdout or "", push_result.stderr or ""
@@ -1588,11 +1682,133 @@ async def batch_create_files(request: BatchCreateFilesRequest) -> BatchCreateFil
     return BatchCreateFilesResponse(success=(failed == 0), results=results, created=created, failed=failed)
 
 
+# ---------------------------------------------------------------------------
+# Save file — write arbitrary content to a file within allowed workspaces
+# ---------------------------------------------------------------------------
+
+class SaveFileRequest(BaseModel):
+    """Payload for /save-file."""
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the workspace root.")
+    filename: str = Field(..., min_length=1, description="Relative filename (e.g. 'research/paper.md').")
+    content: str = Field(..., description="Full file content to write.")
+
+
+class SaveFileResponse(BaseModel):
+    success: bool
+    message: str = ""
+    path: str = ""
+
+
+@app.post(
+    "/save-file",
+    response_model=SaveFileResponse,
+    tags=["System"],
+    summary="Save a file within an allowed workspace",
+)
+async def save_file(request: SaveFileRequest) -> SaveFileResponse:
+    """Write content to a file. Creates parent directories as needed. Overwrites if exists."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return SaveFileResponse(success=False, message="Workspace path is not within any allowed workspace.")
+    try:
+        full_path = (resolved_workspace / request.filename.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return SaveFileResponse(success=False, message="Filename escapes the workspace directory.")
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(request.content, encoding="utf-8")
+        logger.info("Saved file: %s (%d chars)", full_path, len(request.content))
+        return SaveFileResponse(success=True, message=f"Saved to {full_path}", path=str(full_path))
+    except OSError as exc:
+        logger.warning("Failed to save file '%s': %s", full_path, exc)
+        return SaveFileResponse(success=False, message=f"Write failed: {exc!s}")
+
+
+# ---------------------------------------------------------------------------
+# Save Markdown as PDF (research papers) — save directly on workspace (e.g. Desktop)
+# ---------------------------------------------------------------------------
+
+class SaveMarkdownAsPdfRequest(BaseModel):
+    """Payload for /save-markdown-as-pdf."""
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the workspace (e.g. Desktop).")
+    filename: str = Field(..., min_length=1, description="PDF filename only (e.g. 'research-paper-2026-02-28.pdf').")
+    content: str = Field(..., description="Markdown content to convert to PDF.")
+
+
+class SaveMarkdownAsPdfResponse(BaseModel):
+    success: bool
+    message: str = ""
+    path: str = ""
+
+
+def _markdown_to_pdf_sync(md_content: str) -> bytes:
+    """Convert markdown string to PDF bytes. Returns empty bytes on error."""
+    html_body = markdown.markdown(
+        md_content,
+        extensions=["extra", "nl2br", "sane_lists"],
+    )
+    html_doc = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        "<style>body{font-family:Georgia,serif;margin:2em;line-height:1.6;}</style></head>"
+        f"<body>{html_body}</body></html>"
+    )
+    out = BytesIO()
+    try:
+        pisa_status = pisa.CreatePDF(html_doc.encode("utf-8"), dest=out, encoding="utf-8")
+        if pisa_status.err:
+            logger.warning("xhtml2pdf reported errors: %s", pisa_status.err)
+        return out.getvalue()
+    except Exception as exc:
+        logger.warning("Markdown to PDF conversion failed: %s", exc)
+        return b""
+
+
+@app.post(
+    "/save-markdown-as-pdf",
+    response_model=SaveMarkdownAsPdfResponse,
+    tags=["System"],
+    summary="Convert Markdown to PDF and save in workspace",
+)
+async def save_markdown_as_pdf(request: SaveMarkdownAsPdfRequest) -> SaveMarkdownAsPdfResponse:
+    """Convert markdown content to PDF and save to workspace_path/filename (e.g. Desktop/research-paper.pdf)."""
+    allowed, resolved_workspace = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return SaveMarkdownAsPdfResponse(success=False, message="Workspace path is not within any allowed workspace.")
+    if not request.filename.lower().endswith(".pdf"):
+        return SaveMarkdownAsPdfResponse(success=False, message="Filename must end with .pdf")
+    try:
+        full_path = (resolved_workspace / request.filename.replace("\\", "/").strip("/")).resolve()
+        full_path.relative_to(resolved_workspace)
+    except (ValueError, OSError):
+        return SaveMarkdownAsPdfResponse(success=False, message="Filename escapes the workspace directory.")
+    pdf_bytes = await asyncio.to_thread(_markdown_to_pdf_sync, request.content)
+    if not pdf_bytes:
+        return SaveMarkdownAsPdfResponse(success=False, message="Markdown to PDF conversion failed.")
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(pdf_bytes)
+        logger.info("Saved PDF: %s (%d bytes)", full_path, len(pdf_bytes))
+        return SaveMarkdownAsPdfResponse(success=True, message=f"Saved to {full_path}", path=str(full_path))
+    except OSError as exc:
+        logger.warning("Failed to save PDF '%s': %s", full_path, exc)
+        return SaveMarkdownAsPdfResponse(success=False, message=f"Write failed: {exc!s}")
+
+
+def _is_command_allowed(normalized: str) -> bool:
+    if normalized in RUN_COMMAND_WHITELIST:
+        return True
+    for prefix in RUN_COMMAND_PREFIX_WHITELIST:
+        if normalized == prefix or normalized.startswith(prefix + " "):
+            return True
+    return False
+
+
 def _run_command_sync(workspace_path: Path, command_line: str) -> tuple[bool, str, str, int]:
     """Run a whitelisted command in the given directory. Returns (success, stdout, stderr, exit_code)."""
     normalized = " ".join(command_line.strip().lower().split())
-    if normalized not in RUN_COMMAND_WHITELIST:
-        return False, "", f"Command not in whitelist. Allowed: {sorted(RUN_COMMAND_WHITELIST)}", -1
+    if not _is_command_allowed(normalized):
+        return False, "", f"Command not allowed. Exact: {sorted(RUN_COMMAND_WHITELIST)}. Prefixes: {RUN_COMMAND_PREFIX_WHITELIST}", -1
     try:
         result = subprocess.run(
             command_line.strip().split(),
@@ -1638,6 +1854,65 @@ async def run_command(request: RunCommandRequest) -> RunCommandResponse:
         stderr=stderr,
         exit_code=exit_code,
         error="" if ok else (stderr or "Command failed."),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scaffold command runner — for project initialization (longer timeout, shell=True)
+# ---------------------------------------------------------------------------
+
+def _run_scaffold_sync(workspace_path: Path, command_line: str) -> tuple[bool, str, str, int]:
+    """Run a scaffold command with shell=True and 300s timeout."""
+    normalized = " ".join(command_line.strip().lower().split())
+    if not _is_scaffold_allowed(normalized):
+        return False, "", f"Scaffold command not allowed. Allowed prefixes: {RUN_SCAFFOLD_PREFIX_WHITELIST}", -1
+    try:
+        result = subprocess.run(
+            command_line.strip(),
+            cwd=workspace_path,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            shell=True,
+        )
+        return True, result.stdout or "", result.stderr or "", result.returncode
+    except subprocess.TimeoutExpired:
+        return False, "", "Scaffold command timed out (300s).", -1
+    except Exception as e:
+        return False, "", str(e), -1
+
+
+@app.post(
+    "/run-scaffold",
+    response_model=RunCommandResponse,
+    tags=["System"],
+    summary="Run a scaffold/init command in a workspace (e.g. npx create-next-app)",
+)
+async def run_scaffold(request: RunCommandRequest) -> RunCommandResponse:
+    """
+    Run a whitelisted scaffold command. Used for project initialization only.
+    Longer timeout (300s) and shell=True to support npx/npm commands.
+    """
+    allowed, resolved = _is_path_within_allowed_workspaces(request.workspace_path.strip())
+    if not allowed:
+        return RunCommandResponse(
+            success=False,
+            error="Workspace path is not within any allowed workspace.",
+        )
+    if not resolved.exists():
+        resolved.mkdir(parents=True, exist_ok=True)
+        logger.info("Created scaffold target directory: %s", resolved)
+    ok, stdout, stderr, exit_code = await asyncio.to_thread(
+        _run_scaffold_sync,
+        resolved,
+        request.command_line.strip(),
+    )
+    return RunCommandResponse(
+        success=ok,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        error="" if ok else (stderr or "Scaffold command failed."),
     )
 
 
@@ -1945,6 +2220,163 @@ async def git_push_only(request: PushRequest):
         request.workspace_path,
     )
     return PushResponse(success=ok, message=msg, stdout=stdout, stderr=stderr)
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo creation
+# ---------------------------------------------------------------------------
+
+_GITHUB_API = "https://api.github.com"
+
+
+def _github_get_authenticated_user(headers: dict) -> Optional[str]:
+    """Get the authenticated user's login name."""
+    try:
+        resp = requests.get(f"{_GITHUB_API}/user", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.json().get("login")
+    except Exception:
+        pass
+    return None
+
+
+def _github_get_existing_repo(owner: str, name: str, headers: dict) -> Optional[GitHubCreateRepoResponse]:
+    """Fetch an existing repo's info. Returns None if not found."""
+    try:
+        resp = requests.get(f"{_GITHUB_API}/repos/{owner}/{name}", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            return GitHubCreateRepoResponse(
+                success=True,
+                message=f"Repository '{name}' already exists. Using existing repo.",
+                html_url=data.get("html_url", ""),
+                clone_url=data.get("clone_url", ""),
+                name=data.get("name", name),
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _github_create_repo_sync(name: str, description: str, private: bool) -> GitHubCreateRepoResponse:
+    token = getattr(settings, "github_token", None)
+    if not token:
+        return GitHubCreateRepoResponse(success=False, message="GITHUB_TOKEN is not configured in daemon .env.")
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    body = {"name": name, "description": description, "private": private, "auto_init": False}
+    try:
+        resp = requests.post(f"{_GITHUB_API}/user/repos", json=body, headers=headers, timeout=30)
+        data = resp.json()
+        if resp.status_code in (200, 201):
+            return GitHubCreateRepoResponse(
+                success=True,
+                message=f"Repository '{name}' created.",
+                html_url=data.get("html_url", ""),
+                clone_url=data.get("clone_url", ""),
+                name=data.get("name", name),
+            )
+        # If repo already exists, return the existing repo's info instead of failing
+        errors = data.get("errors", [])
+        already_exists = any(
+            e.get("message", "").lower().startswith("name already exists")
+            for e in errors
+        ) if errors else ("already exists" in data.get("message", "").lower())
+
+        if already_exists:
+            logger.info("Repo '%s' already exists, fetching existing info.", name)
+            owner = _github_get_authenticated_user(headers)
+            if owner:
+                existing = _github_get_existing_repo(owner, name, headers)
+                if existing:
+                    return existing
+
+        msg = data.get("message", f"GitHub API returned {resp.status_code}")
+        if errors:
+            msg += " — " + "; ".join(e.get("message", str(e)) for e in errors)
+        return GitHubCreateRepoResponse(success=False, message=msg)
+    except Exception as exc:
+        logger.error("GitHub create repo failed: %s", exc)
+        return GitHubCreateRepoResponse(success=False, message=f"Request failed: {exc!s}")
+
+
+@app.post(
+    "/github/create-repo",
+    response_model=GitHubCreateRepoResponse,
+    tags=["GitHub"],
+    summary="Create a new GitHub repository",
+)
+async def github_create_repo(request: GitHubCreateRepoRequest) -> GitHubCreateRepoResponse:
+    """Create a new repository on GitHub using the REST API. Requires GITHUB_TOKEN in daemon config."""
+    return await asyncio.to_thread(_github_create_repo_sync, request.name, request.description, request.private)
+
+
+# ---------------------------------------------------------------------------
+# Git clone
+# ---------------------------------------------------------------------------
+
+_CLONE_TIMEOUT = 120
+
+
+def _git_clone_sync(clone_url: str, parent_directory: str, folder_name: Optional[str]) -> GitCloneResponse:
+    logger.info("git clone: url=%s parent=%s folder=%s", clone_url, parent_directory, folder_name)
+    allowed, resolved_parent = _is_path_within_allowed_workspaces(parent_directory)
+    if not allowed:
+        return GitCloneResponse(success=False, message=f"parent_directory '{parent_directory}' is not within any allowed workspace. Allowed: {settings.allowed_workspaces}")
+    if not resolved_parent.is_dir():
+        return GitCloneResponse(success=False, message=f"parent_directory resolved to '{resolved_parent}' which does not exist or is not a directory.")
+
+    if folder_name:
+        folder = folder_name.strip().replace("\\", "/").split("/")[0]
+    else:
+        folder = clone_url.rstrip("/").split("/")[-1]
+        if folder.endswith(".git"):
+            folder = folder[:-4]
+
+    target = (resolved_parent / folder).resolve()
+    try:
+        target.relative_to(resolved_parent)
+    except ValueError:
+        return GitCloneResponse(success=False, message="folder_name escapes the parent directory.")
+
+    if target.exists():
+        if (target / ".git").is_dir():
+            logger.info("Target '%s' already exists and is a git repo, reusing.", target)
+            return GitCloneResponse(success=True, message=f"Already cloned at {target}", local_path=str(target))
+        return GitCloneResponse(success=False, message=f"Target directory already exists (not a git repo): {target}")
+
+    token = getattr(settings, "github_token", None)
+    auth_url = clone_url
+    if token and clone_url.startswith("https://github.com/"):
+        auth_url = clone_url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+    try:
+        result = subprocess.run(
+            ["git", "clone", auth_url, str(target)],
+            capture_output=True, text=True, timeout=_CLONE_TIMEOUT,
+        )
+        if result.returncode != 0:
+            return GitCloneResponse(success=False, message=f"git clone failed: {result.stderr.strip()}")
+        logger.info("Cloned %s → %s", clone_url, target)
+        return GitCloneResponse(success=True, message=f"Cloned to {target}", local_path=str(target))
+    except subprocess.TimeoutExpired:
+        return GitCloneResponse(success=False, message=f"git clone timed out after {_CLONE_TIMEOUT}s.")
+    except Exception as exc:
+        logger.error("git clone failed: %s", exc)
+        return GitCloneResponse(success=False, message=f"git clone error: {exc!s}")
+
+
+@app.post(
+    "/git/clone",
+    response_model=GitCloneResponse,
+    tags=["Git"],
+    summary="Clone a GitHub repository into an allowed workspace",
+)
+async def git_clone(request: GitCloneRequest) -> GitCloneResponse:
+    """Clone a repository from GitHub into parent_directory. The parent must be within ALLOWED_WORKSPACES."""
+    return await asyncio.to_thread(_git_clone_sync, request.clone_url, request.parent_directory, request.folder_name)
 
 
 @app.post(
@@ -2705,6 +3137,234 @@ def _run_git_apply(
         timeout=60,
         shell=False,  # IMPORTANT: never True — prevents shell injection.
     )
+
+
+# ---------------------------------------------------------------------------
+# DevMode Builder — execute a single build step (scaffold, aider, shell)
+# ---------------------------------------------------------------------------
+
+class BuildStepRequest(BaseModel):
+    """Payload for /execute-build-step."""
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the working directory for this step.")
+    step_name: str = Field("", description="Human-readable phase name (for logging).")
+    description: str = Field("", description="Full description / aider instructions for this step.")
+    terminal_commands: List[str] = Field(default_factory=list, description="Ordered shell commands to execute.")
+
+
+class BuildStepResponse(BaseModel):
+    success: bool
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
+    error: str = ""
+
+
+def _is_build_command_safe(cmd: str) -> bool:
+    """Reject obviously dangerous patterns but allow the broad set needed for project builds."""
+    normalized = cmd.strip().lower()
+    dangerous = ("rm -rf /", "mkfs", "dd if=", ":(){", "fork bomb", "> /dev/sd", "chmod -r 777 /")
+    return not any(d in normalized for d in dangerous)
+
+
+def _execute_build_step_sync(
+    workspace_path: Path,
+    step_name: str,
+    description: str,
+    terminal_commands: List[str],
+) -> tuple[bool, str, str, int, str]:
+    """Run all terminal commands for one build step sequentially. Stops on first failure."""
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    all_stdout: List[str] = []
+    all_stderr: List[str] = []
+    last_exit_code = 0
+
+    for i, cmd in enumerate(terminal_commands):
+        cmd = cmd.strip()
+        if not cmd:
+            continue
+        if not _is_build_command_safe(cmd):
+            return False, "\n".join(all_stdout), "\n".join(all_stderr), -1, f"Command rejected as unsafe: {cmd}"
+
+        logger.info("[build-step] %s — running command %d/%d: %s", step_name, i + 1, len(terminal_commands), cmd[:120])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=600,
+                shell=True,
+            )
+            stdout_chunk = (result.stdout or "").strip()
+            stderr_chunk = (result.stderr or "").strip()
+            if stdout_chunk:
+                all_stdout.append(f"[cmd {i+1}] {stdout_chunk}")
+            if stderr_chunk:
+                all_stderr.append(f"[cmd {i+1}] {stderr_chunk}")
+            last_exit_code = result.returncode
+
+            if result.returncode != 0:
+                error_detail = stderr_chunk or stdout_chunk or f"Exit code {result.returncode}"
+                logger.warning("[build-step] %s — command %d failed (exit %d): %s", step_name, i + 1, result.returncode, error_detail[:200])
+                return False, "\n".join(all_stdout), "\n".join(all_stderr), result.returncode, f"Command {i+1} failed: {error_detail[:500]}"
+
+        except subprocess.TimeoutExpired:
+            return False, "\n".join(all_stdout), "\n".join(all_stderr), -1, f"Command {i+1} timed out (600s): {cmd[:100]}"
+        except Exception as exc:
+            return False, "\n".join(all_stdout), "\n".join(all_stderr), -1, f"Command {i+1} exception: {exc!s}"
+
+    return True, "\n".join(all_stdout), "\n".join(all_stderr), last_exit_code, ""
+
+
+@app.post(
+    "/execute-build-step",
+    response_model=BuildStepResponse,
+    tags=["DevMode"],
+    summary="Execute a single build step (scaffold, aider, shell commands)",
+)
+async def execute_build_step(request: BuildStepRequest) -> BuildStepResponse:
+    """
+    Receive a build step from the DevMode executor and run all its
+    terminal_commands sequentially in the given workspace_path.
+    Stops on the first command that exits non-zero and returns the error.
+    """
+    resolved = Path(request.workspace_path.strip()).resolve()
+    allowed, _ = _is_path_within_allowed_workspaces(str(resolved))
+    if not allowed:
+        parent_allowed, _ = _is_path_within_allowed_workspaces(str(resolved.parent))
+        if not parent_allowed:
+            return BuildStepResponse(success=False, error="Workspace path is not within any allowed workspace.")
+
+    if not request.terminal_commands:
+        return BuildStepResponse(success=True, stdout="(no commands to run)", exit_code=0)
+
+    logger.info("[build-step] Starting step '%s' (%d commands) in %s", request.step_name, len(request.terminal_commands), resolved)
+
+    ok, stdout, stderr, exit_code, error = await asyncio.to_thread(
+        _execute_build_step_sync,
+        resolved,
+        request.step_name or "(unnamed)",
+        request.description or "",
+        request.terminal_commands,
+    )
+
+    return BuildStepResponse(
+        success=ok,
+        stdout=stdout[-4000:] if len(stdout) > 4000 else stdout,
+        stderr=stderr[-2000:] if len(stderr) > 2000 else stderr,
+        exit_code=exit_code,
+        error=error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DevMode — Git push finalisation
+# ---------------------------------------------------------------------------
+
+class GitPushRequest(BaseModel):
+    """Payload for /git-push (DevMode finalisation)."""
+    workspace_path: str = Field(..., min_length=1, description="Absolute path to the project root.")
+    commit_message: str = Field("Autogenerated by Eureka DevMode", description="Commit message.")
+    clone_url: Optional[str] = Field(default=None, description="If set, add (or set) remote origin to this URL before pushing. Enables push to a newly created GitHub repo.")
+
+
+class GitPushResponse(BaseModel):
+    success: bool
+    message: str = ""
+    stdout: str = ""
+    stderr: str = ""
+
+
+def _git_init_if_needed(workspace: Path) -> None:
+    """Ensure the directory is a git repo (git init if not)."""
+    if not (workspace / ".git").exists():
+        subprocess.run(["git", "init"], cwd=str(workspace), capture_output=True, text=True, timeout=30)
+        subprocess.run(["git", "checkout", "-b", "main"], cwd=str(workspace), capture_output=True, text=True, timeout=10)
+
+
+def _git_push_sync(workspace: Path, commit_message: str, clone_url: Optional[str] = None) -> tuple[bool, str, str, str]:
+    """git add -A → git commit → [optional: remote add/set-url origin] → git push. Returns (success, message, stdout, stderr)."""
+    try:
+        _git_init_if_needed(workspace)
+
+        add = subprocess.run(["git", "add", "-A"], cwd=str(workspace), capture_output=True, text=True, timeout=30)
+        if add.returncode != 0:
+            return False, "git add failed", add.stdout or "", add.stderr or ""
+
+        commit = subprocess.run(
+            ["git", "commit", "-m", commit_message],
+            cwd=str(workspace), capture_output=True, text=True, timeout=60,
+        )
+        if commit.returncode != 0:
+            stderr = (commit.stderr or "").strip()
+            if "nothing to commit" in stderr.lower() or "nothing to commit" in (commit.stdout or "").lower():
+                logger.info("[git-push] Nothing to commit in %s", workspace)
+            else:
+                return False, "git commit failed", commit.stdout or "", commit.stderr or ""
+
+        if clone_url and clone_url.strip().startswith("https://github.com/"):
+            check_remote = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(workspace), capture_output=True, text=True, timeout=5,
+            )
+            if check_remote.returncode == 0:
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", clone_url.strip()],
+                    cwd=str(workspace), capture_output=True, text=True, timeout=5,
+                )
+            else:
+                subprocess.run(
+                    ["git", "remote", "add", "origin", clone_url.strip()],
+                    cwd=str(workspace), capture_output=True, text=True, timeout=5,
+                )
+            logger.info("[git-push] Set remote origin to %s", clone_url[:50])
+
+        push = subprocess.run(
+            ["git", "push", "-u", "origin", "main"],
+            cwd=str(workspace), capture_output=True, text=True, timeout=120,
+        )
+        if push.returncode != 0:
+            push = subprocess.run(
+                ["git", "push", "-u", "origin", "HEAD"],
+                cwd=str(workspace), capture_output=True, text=True, timeout=120,
+            )
+        if push.returncode != 0:
+            return False, "git push failed", push.stdout or "", push.stderr or ""
+
+        return True, "Committed and pushed successfully.", push.stdout or "", push.stderr or ""
+    except subprocess.TimeoutExpired:
+        return False, "Git command timed out.", "", ""
+    except Exception as exc:
+        return False, f"Git error: {exc!s}", "", ""
+
+
+@app.post(
+    "/git-push",
+    response_model=GitPushResponse,
+    tags=["DevMode"],
+    summary="Finalise a DevMode build: git add, commit, and push",
+)
+async def git_push_endpoint(request: GitPushRequest) -> GitPushResponse:
+    """Add all files, commit with the given message, and push to origin."""
+    resolved = Path(request.workspace_path.strip()).resolve()
+    allowed, _ = _is_path_within_allowed_workspaces(str(resolved))
+    if not allowed:
+        return GitPushResponse(success=False, message="Workspace path is not within any allowed workspace.")
+    if not resolved.exists():
+        return GitPushResponse(success=False, message=f"Path does not exist: {resolved}")
+
+    logger.info("[git-push] Finalising %s", resolved)
+
+    clone_url_arg = request.clone_url.strip() if request.clone_url and request.clone_url.strip() else None
+    ok, message, stdout, stderr = await asyncio.to_thread(
+        _git_push_sync,
+        resolved,
+        request.commit_message.strip() or "Autogenerated by Eureka DevMode",
+        clone_url_arg,
+    )
+    return GitPushResponse(success=ok, message=message, stdout=stdout[-2000:], stderr=stderr[-2000:])
 
 
 # ---------------------------------------------------------------------------
