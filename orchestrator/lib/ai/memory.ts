@@ -35,8 +35,8 @@ export const UserProfileSchema = z.object({
         .describe("Names or URLs of repos the user is actively working on."),
     awsRegion: z
         .string()
-        .optional()
-        .describe("Preferred AWS region (e.g. us-east-1). Omit if unknown."),
+        .default("")
+        .describe("Preferred AWS region (e.g. us-east-1). Use empty string if unknown."),
     cloudProviders: z
         .array(z.string())
         .describe("Cloud/infra providers the user uses (e.g. AWS, Vercel, Cloudflare, GCP)."),
@@ -45,12 +45,12 @@ export const UserProfileSchema = z.object({
         .describe("Databases the user works with (e.g. PostgreSQL, Redis, DynamoDB)."),
     os: z
         .string()
-        .optional()
-        .describe("Operating system (e.g. Windows 11, macOS Sonoma). Omit if unknown."),
+        .default("")
+        .describe("Operating system (e.g. Windows 11, macOS Sonoma). Use empty string if unknown."),
     editor: z
         .string()
-        .optional()
-        .describe("Primary code editor (e.g. Cursor, VS Code). Omit if unknown."),
+        .default("")
+        .describe("Primary code editor (e.g. Cursor, VS Code). Use empty string if unknown."),
     deploymentTargets: z
         .array(z.string())
         .describe("Where the user deploys apps (e.g. Vercel, Docker, EC2)."),
@@ -81,8 +81,11 @@ const EMPTY_PROFILE: UserProfile = {
     preferredLanguages: [],
     frameworks: [],
     activeRepositories: [],
+    awsRegion: "",
     cloudProviders: [],
     databases: [],
+    os: "",
+    editor: "",
     deploymentTargets: [],
     customPreferences: [],
 };

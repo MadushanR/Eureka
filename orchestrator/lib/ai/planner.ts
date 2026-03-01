@@ -83,7 +83,13 @@ const PLANNER_SYSTEM_PROMPT =
     "- Late steps: integration wiring, environment config.\n" +
     "- Final step: ALWAYS a test / build verification step (npm run build, pytest, etc.).\n\n" +
     "Terminal command rules:\n" +
-    "- For scaffolding: use real CLI commands (npx create-next-app@latest <name> --ts --tailwind --app --use-npm, etc.).\n" +
+    "- Scaffold commands run HEADLESS (no terminal input). They must never prompt for user input.\n" +
+    "- create-next-app: add --yes and options, e.g. npx create-next-app@latest <name> --yes --ts --tailwind --eslint --app --use-npm.\n" +
+    "- create-vite: pass --template (e.g. react-ts, vue-ts). With npm use: npm create vite@latest <name> -- --template react-ts. Optionally add --no-interactive.\n" +
+    "- create-react-app: pass --template typescript (or template name), e.g. npx create-react-app <name> --template typescript.\n" +
+    "- django-admin startproject/startapp: pass project name as argument; no extra flags needed.\n" +
+    "- npm init / yarn init: use -y or --yes (e.g. npm init -y, yarn init -y). pnpm init is non-interactive by default.\n" +
+    "- pnpm create (e.g. create-vite): pass project name and --template, e.g. pnpm create vite <name> --template react-ts.\n" +
     "- For AI code generation: use exactly this format:\n" +
     '  aider --message "<DETAILED INSTRUCTIONS>" --yes --auto-commits\n' +
     "  The message must be self-contained and describe ALL files to create/edit and their full contents.\n" +

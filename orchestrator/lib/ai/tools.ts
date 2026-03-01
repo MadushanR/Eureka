@@ -676,10 +676,10 @@ export const runTests = tool({
  */
 export const runScaffold = tool({
     description:
-        "Run a project scaffolding or initialization command. Use for setting up new projects with framework CLIs. " +
-        "Allowed commands: npx create-next-app, npx create-react-app, npx create-vite, django-admin startproject, " +
-        "npm init, yarn init, pnpm init, pnpm create, python -m venv, pip install, git init. " +
-        "Has a 300 second timeout. The workspace directory is created automatically if it doesn't exist.",
+        "Run a project scaffolding or initialization command. Commands run HEADLESS (no input). Use non-interactive flags only: " +
+        "create-next-app: add --yes; create-vite: add --template <name> (e.g. react-ts); create-react-app: add --template typescript; " +
+        "npm/yarn init: use -y. Allowed: npx create-next-app, npx create-react-app, npx create-vite, django-admin startproject, " +
+        "npm init, yarn init, pnpm init, pnpm create, python -m venv, pip install, git init. 300s timeout.",
     inputSchema: z.object({
         workspace_path: z
             .string()
@@ -688,7 +688,7 @@ export const runScaffold = tool({
         command_line: z
             .string()
             .min(1, "command_line must not be empty.")
-            .describe("Scaffold command to run, e.g. 'npx create-next-app@latest my-app --typescript --tailwind --eslint --app --use-npm'."),
+            .describe("Scaffold command to run (must be non-interactive). E.g. 'npx create-next-app@latest my-app --yes --typescript --tailwind --eslint --app --use-npm'."),
     }),
     async execute({
         workspace_path,

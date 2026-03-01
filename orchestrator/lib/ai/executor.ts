@@ -12,6 +12,7 @@
  *   executeProjectRoadmap(plan, senderId, sendUpdate)
  */
 
+import { Agent, fetch as undiciFetch } from "undici";
 import type { ProjectPlan, BuildStep } from "./planner";
 import { createJob, updateJob, getJob, clearActiveJob, type DevJob, type DevJobPhase } from "@/lib/redis";
 
@@ -54,22 +55,61 @@ const daemonUrl = (): string =>
 const workspacePath = (): string =>
     process.env.LOCAL_DAEMON_WORKSPACE_PATH?.replace(/\/+$/, "") ?? "C:/Users/madus/Desktop";
 
-async function callDaemon<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {
+/** Default fetch timeout for daemon calls (ms). Build steps use a longer timeout. */
+const DEFAULT_DAEMON_TIMEOUT_MS = 30_000;
+/** Timeout for /execute-build-step (daemon allows 600s per command). */
+const BUILD_STEP_TIMEOUT_MS = 620_000;
+
+async function callDaemon<T>(
+    endpoint: string,
+    body: Record<string, unknown>,
+    timeoutMs: number = DEFAULT_DAEMON_TIMEOUT_MS,
+): Promise<T> {
     const base = daemonUrl();
-    if (!base) throw new Error("LOCAL_DAEMON_URL is not configured.");
-
-    const res = await fetch(`${base}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => "(no body)");
-        throw new Error(`Daemon ${endpoint} returned ${res.status}: ${text}`);
+    if (!base) {
+        throw new Error(
+            "LOCAL_DAEMON_URL is not configured. Add it to .env.local (e.g. LOCAL_DAEMON_URL=http://127.0.0.1:8765) and ensure the daemon is running.",
+        );
     }
 
-    return (await res.json()) as T;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Node's global fetch uses undici with ~300s default headersTimeout, which fires before
+    // long build steps complete. Use undici fetch with a custom Agent so our timeout is respected.
+    const dispatcher = new Agent({
+        headersTimeout: timeoutMs,
+        bodyTimeout: timeoutMs,
+        connectTimeout: Math.min(timeoutMs, 30_000),
+    });
+
+    try {
+        const res = await undiciFetch(`${base}${endpoint}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+            dispatcher,
+        });
+        clearTimeout(timeoutId);
+        if (!res.ok) {
+            const text = await res.text().catch(() => "(no body)");
+            throw new Error(`Daemon ${endpoint} returned ${res.status}: ${text}`);
+        }
+        return (await res.json()) as T;
+    } catch (err) {
+        clearTimeout(timeoutId);
+        if (err instanceof Error && err.name === "AbortError") {
+            throw new Error(
+                `Daemon ${endpoint} timed out after ${timeoutMs}ms. Check LOCAL_DAEMON_URL (${base}) and that the daemon is running.`,
+            );
+        }
+        const cause = err instanceof Error ? err.message : String(err);
+        throw new Error(
+            `Daemon request failed (${endpoint}): ${cause}. Check LOCAL_DAEMON_URL in .env.local and that the daemon is running at ${base}.`,
+            { cause: err instanceof Error ? err : undefined },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,12 +125,16 @@ async function executeBuildStep(
             ? projectRoot
             : `${projectRoot}/${step.targetDirectory.replace(/^\/+/, "")}`;
 
-    return callDaemon<StepResult>("/execute-build-step", {
-        workspace_path: targetDir,
-        step_name: step.stepName,
-        description: step.description,
-        terminal_commands: step.terminalCommands,
-    });
+    return callDaemon<StepResult>(
+        "/execute-build-step",
+        {
+            workspace_path: targetDir,
+            step_name: step.stepName,
+            description: step.description,
+            terminal_commands: step.terminalCommands,
+        },
+        BUILD_STEP_TIMEOUT_MS,
+    );
 }
 
 // ---------------------------------------------------------------------------

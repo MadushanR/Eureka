@@ -1143,6 +1143,37 @@ def _git_uncommitted_diff_sync(workspace_path: str) -> tuple[bool, str, str, str
         return False, str(e), "", "", False
 
 
+def _inject_github_token_into_url(url: str) -> str:
+    """If GITHUB_TOKEN is set and url is https://github.com/..., return URL with token (always use token, no OAuth)."""
+    token = getattr(settings, "github_token", None)
+    if not token or not url.strip().startswith("https://github.com/"):
+        return url
+    if "x-access-token:" in url or "@github.com" in url.split("//")[-1]:
+        return url
+    return url.strip().replace("https://", f"https://x-access-token:{token}@", 1)
+
+
+def _ensure_origin_uses_token(workspace: Path) -> None:
+    """Set origin URL to token-authenticated form so git push never prompts for OAuth."""
+    token = getattr(settings, "github_token", None)
+    if not token:
+        return
+    get_url = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=str(workspace), capture_output=True, text=True, timeout=5,
+    )
+    if get_url.returncode != 0 or not get_url.stdout:
+        return
+    current = get_url.stdout.strip()
+    auth_url = _inject_github_token_into_url(current)
+    if auth_url != current:
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", auth_url],
+            cwd=str(workspace), capture_output=True, text=True, timeout=5,
+        )
+        logger.debug("Set origin to token-based URL for push.")
+
+
 def _git_commit_and_push_sync(workspace_path: str, commit_message: str) -> tuple[bool, str, str, str]:
     """Run git add -A, git commit, git push. Returns (success, message, stdout, stderr)."""
     allowed, resolved = _is_path_within_allowed_workspaces(workspace_path)
@@ -1150,6 +1181,7 @@ def _git_commit_and_push_sync(workspace_path: str, commit_message: str) -> tuple
         return False, "Workspace path is not in ALLOWED_WORKSPACES.", "", ""
     if not (resolved / ".git").exists():
         return False, "Not a git repository.", "", ""
+    _ensure_origin_uses_token(Path(resolved))
     try:
         add_result = subprocess.run(
             ["git", "add", "-A"],
@@ -1239,6 +1271,7 @@ def _git_push_only_sync(workspace_path: str, push_timeout: int = 60) -> tuple[bo
         return False, "Workspace path is not in ALLOWED_WORKSPACES.", "", ""
     if not (resolved / ".git").exists():
         return False, "Not a git repository.", "", ""
+    _ensure_origin_uses_token(Path(resolved))
     try:
         push_result = subprocess.run(
             ["git", "push"],
@@ -3287,6 +3320,23 @@ def _is_build_command_safe(cmd: str) -> bool:
     return not any(d in normalized for d in dangerous)
 
 
+def _run_build_command(cmd: str, cwd: str) -> subprocess.CompletedProcess[str]:
+    """Run a single build command. On Windows, if cmd uses bash heredoc (<<), run via bash."""
+    run_kw: dict = dict(
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        stdin=subprocess.DEVNULL,
+    )
+    if sys.platform == "win32" and "<<" in cmd:
+        # cmd.exe does not support heredocs; run with bash (e.g. Git for Windows).
+        bash_path = shutil.which("bash")
+        if bash_path:
+            return subprocess.run([bash_path, "-c", cmd], **run_kw)
+    return subprocess.run(cmd, shell=True, **run_kw)
+
+
 def _execute_build_step_sync(
     workspace_path: Path,
     step_name: str,
@@ -3295,6 +3345,7 @@ def _execute_build_step_sync(
 ) -> tuple[bool, str, str, int, str]:
     """Run all terminal commands for one build step sequentially. Stops on first failure."""
     workspace_path.mkdir(parents=True, exist_ok=True)
+    cwd_str = str(workspace_path)
 
     all_stdout: List[str] = []
     all_stderr: List[str] = []
@@ -3310,14 +3361,7 @@ def _execute_build_step_sync(
         logger.info("[build-step] %s — running command %d/%d: %s", step_name, i + 1, len(terminal_commands), cmd[:120])
 
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=str(workspace_path),
-                capture_output=True,
-                text=True,
-                timeout=600,
-                shell=True,
-            )
+            result = _run_build_command(cmd, cwd_str)
             stdout_chunk = (result.stdout or "").strip()
             stderr_chunk = (result.stderr or "").strip()
             if stdout_chunk:
@@ -3426,21 +3470,24 @@ def _git_push_sync(workspace: Path, commit_message: str, clone_url: Optional[str
                 return False, "git commit failed", commit.stdout or "", commit.stderr or ""
 
         if clone_url and clone_url.strip().startswith("https://github.com/"):
+            auth_clone_url = _inject_github_token_into_url(clone_url.strip())
             check_remote = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=str(workspace), capture_output=True, text=True, timeout=5,
             )
             if check_remote.returncode == 0:
                 subprocess.run(
-                    ["git", "remote", "set-url", "origin", clone_url.strip()],
+                    ["git", "remote", "set-url", "origin", auth_clone_url],
                     cwd=str(workspace), capture_output=True, text=True, timeout=5,
                 )
             else:
                 subprocess.run(
-                    ["git", "remote", "add", "origin", clone_url.strip()],
+                    ["git", "remote", "add", "origin", auth_clone_url],
                     cwd=str(workspace), capture_output=True, text=True, timeout=5,
                 )
-            logger.info("[git-push] Set remote origin to %s", clone_url[:50])
+            logger.info("[git-push] Set remote origin to token-based URL.")
+
+        _ensure_origin_uses_token(workspace)
 
         push = subprocess.run(
             ["git", "push", "-u", "origin", "main"],

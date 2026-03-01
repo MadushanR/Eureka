@@ -331,16 +331,17 @@ const SYSTEM_PROMPT_DEV_DECOMPOSE =
     "- For small projects (<=8 files total), use just 2 phases: setup + implementation.\n" +
     "- For medium projects (9-20 files), use 3-5 phases.\n" +
     "- For large projects (20+ files), use 5-10 phases.\n\n" +
-    "Available scaffold commands (for phase 0):\n" +
-    "- npx create-next-app@latest <name> --typescript --tailwind --eslint --app --use-npm\n" +
-    "- npx create-vite <name> --template react-ts\n" +
-    "- django-admin startproject <name>\n" +
+    "Available scaffold commands (for phase 0). All must be non-interactive (no prompts):\n" +
+    "- npx create-next-app@latest <name> --yes --typescript --tailwind --eslint --app --use-npm\n" +
+    "- npm create vite@latest <name> -- --template react-ts  (or vue-ts, vanilla-ts, etc.)\n" +
+    "- npx create-react-app <name> --template typescript\n" +
+    "- django-admin startproject <name>  (then startapp <appname> if needed)\n" +
     "- python -m venv venv\n" +
     "- npm init -y / yarn init -y / pnpm init\n\n" +
     "Output ONLY valid JSON — no markdown fences, no explanation. Format:\n" +
     '{\n' +
     '  "project_name": "my-project",\n' +
-    '  "scaffold_command": "npx create-next-app@latest my-project --typescript --tailwind --eslint --app --use-npm",\n' +
+    '  "scaffold_command": "npx create-next-app@latest my-project --yes --typescript --tailwind --eslint --app --use-npm",\n' +
     '  "phases": [\n' +
     '    { "name": "Setup", "description": "Create repo, clone, scaffold, install deps", "files": ["package.json", "tsconfig.json"] },\n' +
     '    { "name": "Data Models", "description": "Create database models and types", "files": ["src/types/product.ts", "src/lib/db.ts"] }\n' +
