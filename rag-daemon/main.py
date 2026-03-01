@@ -50,6 +50,9 @@ from pathlib import Path
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Literal
 
+# Disable ChromaDB telemetry before first import (avoids posthog API errors in some versions)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 import chromadb
 import markdown
 from xhtml2pdf import pisa
@@ -1589,6 +1592,25 @@ async def list_folder_contents(folder_path: str) -> ListFolderContentsResponse:
     )
 
 
+def _delete_dir_sync(resolved: Path) -> None:
+    """Delete a directory. On Windows, if rmtree fails with Access denied, try rd /s /q."""
+    try:
+        shutil.rmtree(resolved)
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 5:
+            # Access denied (e.g. .git files locked). Try Windows rd /s /q.
+            r = subprocess.run(
+                ["cmd", "/c", "rd", "/s", "/q", str(resolved)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if r.returncode != 0:
+                raise OSError(exc.errno, f"{exc.strerror}; rd /s /q fallback failed: {r.stderr or r.stdout or ''}") from exc
+        else:
+            raise
+
+
 def _is_allowed_delete_path(resolved: Path) -> bool:
     """True if resolved is inside an allowed workspace and not the workspace root itself."""
     for workspace in settings.allowed_workspaces:
@@ -1634,7 +1656,7 @@ async def delete_path(request: DeletePathRequest) -> DeletePathResponse:
 
     try:
         if resolved.is_dir():
-            await asyncio.to_thread(shutil.rmtree, resolved)
+            await asyncio.to_thread(_delete_dir_sync, resolved)
             logger.info("Deleted folder: %s", resolved)
             return DeletePathResponse(success=True, message=f"Deleted folder: {resolved}")
         resolved.unlink()
@@ -3320,8 +3342,23 @@ def _is_build_command_safe(cmd: str) -> bool:
     return not any(d in normalized for d in dangerous)
 
 
+def _get_windows_bash_path() -> Optional[str]:
+    """Prefer Git for Windows bash (works with Windows paths). Avoid WSL bash (fails with Windows cwd)."""
+    for candidate in (
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Git", "bin", "bash.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Git", "bin", "bash.exe"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    which_bash = shutil.which("bash")
+    if which_bash and "System32" in which_bash:
+        # WSL stub (e.g. C:\Windows\System32\bash.exe) — fails with execvpe(/bin/bash) when cwd is Windows path
+        return None
+    return which_bash
+
+
 def _run_build_command(cmd: str, cwd: str) -> subprocess.CompletedProcess[str]:
-    """Run a single build command. On Windows, if cmd uses bash heredoc (<<), run via bash."""
+    """Run a single build command. On Windows, run via Git bash when available so Unix commands (cp, true, etc.) work."""
     run_kw: dict = dict(
         cwd=cwd,
         capture_output=True,
@@ -3329,9 +3366,8 @@ def _run_build_command(cmd: str, cwd: str) -> subprocess.CompletedProcess[str]:
         timeout=600,
         stdin=subprocess.DEVNULL,
     )
-    if sys.platform == "win32" and "<<" in cmd:
-        # cmd.exe does not support heredocs; run with bash (e.g. Git for Windows).
-        bash_path = shutil.which("bash")
+    if sys.platform == "win32":
+        bash_path = _get_windows_bash_path()
         if bash_path:
             return subprocess.run([bash_path, "-c", cmd], **run_kw)
     return subprocess.run(cmd, shell=True, **run_kw)

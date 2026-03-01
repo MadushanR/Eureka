@@ -219,7 +219,11 @@ export async function executeProjectRoadmap(
             const result = await executeBuildStep(step, projectRoot);
 
             if (!result.success) {
-                const errDetail = result.error || result.stderr || "Unknown error";
+                let errDetail = result.error || result.stderr || "Unknown error";
+                const lowerErr = errDetail.toLowerCase();
+                if (lowerErr.includes("aider") && (lowerErr.includes("not found") || lowerErr.includes("command not found"))) {
+                    errDetail += "\n\nTip: Install aider where the daemon runs (e.g. pip install aider-chat). Ensure the same PATH is used when the daemon runs build steps.";
+                }
 
                 jobPhases[i] = { ...jobPhases[i], status: "failed" };
                 await updateJob(job.id, {
@@ -230,7 +234,7 @@ export async function executeProjectRoadmap(
                 });
 
                 await sendUpdate(
-                    `HALTED at ${phaseLabel}\n\nError:\n${errDetail.slice(0, 500)}\n\n` +
+                    `HALTED at ${phaseLabel}\n\nError:\n${errDetail.slice(0, 600)}\n\n` +
                     `${completedSteps.length} of ${totalSteps} steps completed before failure.`,
                 );
                 console.error(`[devmode] ${phaseLabel} FAILED: ${errDetail.slice(0, 200)}`);

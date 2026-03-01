@@ -4,6 +4,10 @@
 # Install with: pip install -r requirements.txt
 #
 # Python 3.11+ is required.
+#
+# Do NOT install aider-chat in this venv — it requires huggingface-hub==1.4.1
+# which conflicts with sentence-transformers. Install aider via pipx instead:
+#   pipx install aider-chat
 # ============================================================
 
 # --- Web Framework -------------------------------------------------------
@@ -19,6 +23,7 @@ chromadb>=0.5.0,<0.6.0             # Local persistent vector store
 
 # --- Embeddings ----------------------------------------------------------
 sentence-transformers>=3.0.0,<4.0.0  # Local embedding models (all-MiniLM-L6-v2)
+transformers>=4.41.0,<5.0.0         # Pinned: sentence-transformers requires 4.x
 
 # --- Sparse Search (BM25) ------------------------------------------------
 rank-bm25>=0.2.2,<0.3.0            # BM25 sparse retrieval for hybrid search

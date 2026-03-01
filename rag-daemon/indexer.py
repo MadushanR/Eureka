@@ -32,6 +32,10 @@ Usage
 
 from __future__ import annotations
 
+import os
+# Disable ChromaDB telemetry before first import (avoids posthog API errors)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 import ast
 import fnmatch
 import hashlib

@@ -51,6 +51,7 @@ import {
     getPendingPushOnly,
     getActiveJob,
     updateJob,
+    clearActiveJob,
     getActiveResearch,
     setActiveResearch,
     clearActiveResearch,
@@ -770,15 +771,17 @@ async function processMessage(message: StandardMessage): Promise<void> {
             return;
         }
 
-        // "status" command: return progress of active dev job or research
+        // "status" command: return progress of active dev job and/or research (both can run at once)
         const lowerText = message.text.trim().toLowerCase();
         if (lowerText === "status" || lowerText === "/status") {
             const activeJob = await getActiveJob(message.senderId);
             const activeResearch = await getActiveResearch(message.senderId);
+            const parts: string[] = [];
 
-            if (activeJob) {
+            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
                 const elapsed = Math.round((Date.now() - activeJob.started_at) / 1000);
                 const lines = [
+                    "**Build**",
                     `Job: ${activeJob.goal.slice(0, 80)}`,
                     `Status: ${activeJob.status}`,
                 ];
@@ -800,40 +803,42 @@ async function processMessage(message: StandardMessage): Promise<void> {
                 if (activeJob.errors.length > 0) {
                     lines.push(`Errors: ${activeJob.errors.slice(-2).join("; ")}`);
                 }
-                await getAdapter().sendResponse({ text: lines.join("\n") }, message.senderId);
-            } else if (activeResearch && !activeResearch.cancelled) {
+                parts.push(lines.join("\n"));
+            }
+            if (activeResearch && !activeResearch.cancelled) {
                 const elapsed = Math.round((Date.now() - activeResearch.started_at) / 1000);
-                await getAdapter().sendResponse(
-                    {
-                        text: `Research in progress (${elapsed}s)\nTopic: ${activeResearch.topic.slice(0, 80)}\n\nSend "cancel" to stop.`,
-                    },
-                    message.senderId,
-                );
+                parts.push(`**Research** (${elapsed}s)\nTopic: ${activeResearch.topic.slice(0, 80)}\nSend "cancel" to stop.`);
+            }
+            if (parts.length === 0) {
+                await getAdapter().sendResponse({ text: "No active build or research running." }, message.senderId);
             } else {
-                await getAdapter().sendResponse({ text: "No active job or research running." }, message.senderId);
+                await getAdapter().sendResponse({ text: parts.join("\n\n") }, message.senderId);
             }
             return;
         }
 
-        // "cancel" command: cancel active dev job or research
+        // "cancel" command: cancel active dev job and/or research (cancels both if both running)
         if (lowerText === "cancel" || lowerText === "/cancel") {
             const activeJob = await getActiveJob(message.senderId);
             const activeResearch = await getActiveResearch(message.senderId);
+            const cancelled: string[] = [];
 
-            if (activeJob) {
+            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
                 await updateJob(activeJob.id, { status: "cancelled", finished_at: Date.now() });
-                await getAdapter().sendResponse(
-                    { text: `Cancelled job: ${activeJob.goal.slice(0, 80)}\n(Note: changes already applied to files remain.)` },
-                    message.senderId,
-                );
-            } else if (activeResearch && !activeResearch.cancelled) {
+                await clearActiveJob(message.senderId);
+                cancelled.push(`Build: ${activeJob.goal.slice(0, 60)}`);
+            }
+            if (activeResearch && !activeResearch.cancelled) {
                 await setResearchCancelled(message.senderId);
+                cancelled.push("Research");
+            }
+            if (cancelled.length === 0) {
+                await getAdapter().sendResponse({ text: "No active build or research to cancel." }, message.senderId);
+            } else {
                 await getAdapter().sendResponse(
-                    { text: "Research cancelled. The pipeline will stop after the current step." },
+                    { text: `Cancelled: ${cancelled.join(", ")}.\n(Note: file changes from the build remain.)` },
                     message.senderId,
                 );
-            } else {
-                await getAdapter().sendResponse({ text: "No active job or research to cancel." }, message.senderId);
             }
             return;
         }
@@ -841,21 +846,14 @@ async function processMessage(message: StandardMessage): Promise<void> {
         // Full-project build: single-prompt autonomous build (intent from user input)
         if (isFullBuildIntent(message.text)) {
             const activeJob = await getActiveJob(message.senderId);
-            const activeResearch = await getActiveResearch(message.senderId);
             if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
                 await getAdapter().sendResponse(
-                    { text: `A job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" or "cancel" first.` },
+                    { text: `A build job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" or "cancel" first.` },
                     message.senderId,
                 );
                 return;
             }
-            if (activeResearch && !activeResearch.cancelled) {
-                await getAdapter().sendResponse(
-                    { text: `Research is running: "${activeResearch.topic.slice(0, 60)}"\nSend "cancel" first.` },
-                    message.senderId,
-                );
-                return;
-            }
+            // Allow starting a build even if research is running (they can run in parallel)
 
             const tgAdapter = getAdapter();
             await tgAdapter.sendResponse(
@@ -878,15 +876,7 @@ async function processMessage(message: StandardMessage): Promise<void> {
 
         // Research requests: multi-agent pipeline (Researcher → Writer → Reviewer)
         if (isResearchRequest(message.text)) {
-            const activeJob = await getActiveJob(message.senderId);
             const activeResearch = await getActiveResearch(message.senderId);
-            if (activeJob && (activeJob.status === "planning" || activeJob.status === "executing")) {
-                await getAdapter().sendResponse(
-                    { text: `A dev job is already running: "${activeJob.goal.slice(0, 60)}"\nSend "status" or "cancel" first.` },
-                    message.senderId,
-                );
-                return;
-            }
             if (activeResearch && !activeResearch.cancelled) {
                 await getAdapter().sendResponse(
                     { text: `Research is already in progress: "${activeResearch.topic.slice(0, 60)}"\nSend "status" to check or "cancel" to stop.` },
@@ -894,6 +884,7 @@ async function processMessage(message: StandardMessage): Promise<void> {
                 );
                 return;
             }
+            // Allow starting research even if a build is running (they can run in parallel)
 
             const tgAdapter = getAdapter();
             await setActiveResearch(message.senderId, message.text);
