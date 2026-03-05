@@ -970,6 +970,22 @@ def _handle_system_status(_payload: dict) -> dict:
     }
 
 
+def _handle_open_url(payload: dict) -> dict:
+    url: str = payload.get("url", "")
+    if not url:
+        return {"success": False, "message": "url is required."}
+    try:
+        if platform.system() == "Windows":
+            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", url])
+        else:
+            subprocess.Popen(["xdg-open", url])
+        return {"success": True, "message": f"Opened: {url}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 def _handle_system_lock(_payload: dict) -> dict:
     try:
         if platform.system() == "Windows":
@@ -1154,6 +1170,7 @@ HANDLERS: dict[str, Any] = {
     "spotify_status": _handle_spotify_status,
     "spotify_close": _handle_spotify_close,
     # System
+    "open_url": _handle_open_url,
     "system_status": _handle_system_status,
     "system_lock": _handle_system_lock,
     "system_shutdown": _handle_system_shutdown,

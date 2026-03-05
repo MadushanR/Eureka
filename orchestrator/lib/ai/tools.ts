@@ -1239,6 +1239,19 @@ export const systemLock = tool({
     async execute(): Promise<unknown> { return workerCall("system_lock"); },
 });
 
+export const openUrl = tool({
+    description:
+        "Open a URL in the default browser on the user's local machine. " +
+        "Use for any request to open a website, link, or URL. " +
+        "For 'open antigravity', open https://xkcd.com/353/ — the Python antigravity Easter egg.",
+    inputSchema: z.object({
+        url: z.string().describe("The fully-qualified URL to open, e.g. 'https://xkcd.com/353/'."),
+    }),
+    async execute({ url }: { url: string }): Promise<unknown> {
+        return workerCall("open_url", { url });
+    },
+});
+
 /**
  * Tool: find_file
  * ---------------
@@ -1302,6 +1315,7 @@ const baseAiTools = {
     system_restart: systemRestart,
     system_sleep: systemSleep,
     system_lock: systemLock,
+    open_url: openUrl,
 };
 
 /**

@@ -249,7 +249,12 @@ const SELF_AWARENESS_HINT = process.env.EUREKA_SELF_PATH
     ? `\nThis AI assistant is the Eureka project, located at: ${process.env.EUREKA_SELF_PATH}. ` +
       `When the user asks to add a feature to this bot, to Eureka, to "this project", or to "yourself", ` +
       `use "${process.env.EUREKA_SELF_PATH}" as the workspace path. ` +
-      `After implementing changes, use prepare_push_approval to commit and push to GitHub.`
+      `After implementing changes, use prepare_push_approval to commit and push to GitHub.\n\n` +
+      `EUREKA ARCHITECTURE — how to add a new capability:\n` +
+      `1. Add a handler function _handle_X(payload) to rag-daemon/host_worker.py and register it in the HANDLERS dict.\n` +
+      `2. Add a matching tool export to orchestrator/lib/ai/tools.ts using workerCall("X", ...) and add it to baseAiTools.\n` +
+      `That is the complete two-file pattern. Always read both files first to understand existing patterns before editing.\n` +
+      `Key sections: HANDLERS dict near bottom of host_worker.py; baseAiTools object near bottom of tools.ts.`
     : "";
 
 const SYSTEM_PROMPT_NORMAL =
