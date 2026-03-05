@@ -143,7 +143,7 @@ export async function generateProjectRoadmap(
             },
         ],
         ...withTelemetry("devmode.planner"),
-    } as Parameters<typeof generateObject>[0]);
+    } as Parameters<typeof generateObject>[0]) as { object: ProjectPlan };
 
     console.info(
         `[planner] Generated roadmap for "${prompt.slice(0, 60)}": ` +

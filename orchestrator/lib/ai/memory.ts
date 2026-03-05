@@ -177,7 +177,7 @@ export async function updateUserProfile(
         await redis.set(profileKey(userId), JSON.stringify(updated), { ex: PROFILE_TTL_SECONDS });
 
         console.info(`[memory] Profile updated for userId="${userId}"`);
-        return updated;
+        return updated as UserProfile;
     } catch (error) {
         console.error(`[memory] updateUserProfile failed for userId="${userId}":`, error);
         return existing;

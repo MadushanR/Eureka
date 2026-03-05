@@ -897,10 +897,6 @@ export const removeLine = tool({
         line_number: number;
         line_end?: number;
     }): Promise<StandardResponse | { success: boolean; error: string }> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         let resolvedPath = workspace_path?.trim();
         if (repo_name?.trim() && !resolvedPath) {
             const path = await resolveRepoName(repo_name);
@@ -978,10 +974,6 @@ export const removeLinesMatching = tool({
         file_path?: string;
         path_glob?: string;
     }): Promise<StandardResponse | { success: boolean; error: string }> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         let resolvedPath = workspace_path?.trim();
         if (repo_name?.trim() && !resolvedPath) {
             const path = await resolveRepoName(repo_name);
