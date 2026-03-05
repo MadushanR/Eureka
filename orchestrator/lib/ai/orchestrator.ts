@@ -22,7 +22,7 @@ import { openai } from "@ai-sdk/openai";
 import type { StandardMessage, StandardResponse } from "@/types/messaging";
 import { getChatHistory, saveChatMessages, createJob, getJob, updateJob, clearActiveJob, getPendingPatch, getPendingPush, type DevJob, type DevJobPhase } from "@/lib/redis";
 import { getUserProfile, formatProfileForPrompt } from "./memory";
-import { aiTools } from "./tools";
+import { aiTools, makeAiTools } from "./tools";
 import { withTelemetry } from "./telemetry";
 
 // ---------------------------------------------------------------------------
@@ -244,6 +244,14 @@ export interface ProcessUserMessageOptions {
     onProgress?: ProgressCallback;
 }
 
+/** Injected into system prompts when EUREKA_SELF_PATH is configured. */
+const SELF_AWARENESS_HINT = process.env.EUREKA_SELF_PATH
+    ? `\nThis AI assistant is the Eureka project, located at: ${process.env.EUREKA_SELF_PATH}. ` +
+      `When the user asks to add a feature to this bot, to Eureka, to "this project", or to "yourself", ` +
+      `use "${process.env.EUREKA_SELF_PATH}" as the workspace path. ` +
+      `After implementing changes, use prepare_push_approval to commit and push to GitHub.`
+    : "";
+
 const SYSTEM_PROMPT_NORMAL =
     "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
@@ -251,7 +259,8 @@ const SYSTEM_PROMPT_NORMAL =
     "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
     "When the user asks to create a new GitHub repo, use github_create_repo. When they ask to clone a repo, use git_clone. " +
     "Do not reply with only a list of repositories when the user asked for an action in a repo (such as checking uncommitted changes or editing code); instead, call the appropriate tool and report the result. " +
-    "Always finish with a concise reply that explains what you did or found.";
+    "Always finish with a concise reply that explains what you did or found." +
+    SELF_AWARENESS_HINT;
 
 const SYSTEM_PROMPT_DEV_PLAN =
     "You are a planning agent. Given the user's request, produce a short numbered plan of concrete steps. " +
@@ -279,7 +288,8 @@ const SYSTEM_PROMPT_DEV_PLAN =
     "Rules:\n" +
     "- Do NOT write unified diffs. The daemon generates them.\n" +
     "- Keep the plan short (3-8 steps).\n" +
-    "- Output ONLY the numbered plan, no other text.";
+    "- Output ONLY the numbered plan, no other text." +
+    SELF_AWARENESS_HINT;
 
 const SYSTEM_PROMPT_DEV_EXECUTE =
     "You are a dev agent. Execute ALL steps of the plan below using the available tools. " +
@@ -305,7 +315,8 @@ const SYSTEM_PROMPT_DEV_EXECUTE =
     "7. If a tool returns success=true (even with 'already exists'), treat it as DONE and move to the NEXT step. Never retry a succeeded step.\n" +
     "8. ALWAYS include the GitHub repo URL (html_url) in your final summary.\n" +
     "9. End with a concise summary of everything you did.\n" +
-    "10. NEVER stop and ask for user input. Always proceed autonomously through every step.";
+    "10. NEVER stop and ask for user input. Always proceed autonomously through every step." +
+    SELF_AWARENESS_HINT;
 
 const SYSTEM_PROMPT_DEV_EVALUATE =
     "You are a QA evaluator. The user asked for a specific change. The dev agent executed some steps. " +
@@ -395,11 +406,13 @@ async function runGenerate(
     messages: ModelMessage[],
     maxSteps: number,
     overrideModel?: ReturnType<typeof openai>,
+    senderId?: string,
 ): Promise<GenerateResult> {
+    const tools = senderId ? makeAiTools(senderId) : aiTools;
     const result = await generateText({
         model: overrideModel ?? model,
         messages,
-        tools: aiTools,
+        tools,
         maxSteps,
         ...withTelemetry("orchestrator.runGenerate"),
     } as Parameters<typeof generateText>[0]);
@@ -464,7 +477,7 @@ async function processNormal(
     let toolResponse: StandardResponse | null = null;
 
     try {
-        const result = await runGenerate(messages, 5);
+        const result = await runGenerate(messages, 5, undefined, senderId);
         if (result.text) finalText = result.text;
         if (result.toolResponse) toolResponse = result.toolResponse;
     } catch (error) {

@@ -73,7 +73,7 @@ async function callWorker<T>(
 }
 
 // ---------------------------------------------------------------------------
-// Execute a single build step
+// Execute a single build step (with one retry on failure)
 // ---------------------------------------------------------------------------
 
 async function executeBuildStep(
@@ -95,6 +95,22 @@ async function executeBuildStep(
         },
         BUILD_STEP_TIMEOUT_MS,
     );
+}
+
+async function executeBuildStepWithRetry(
+    step: BuildStep,
+    projectRoot: string,
+    sendUpdate: ProgressFn,
+    stepLabel: string,
+): Promise<StepResult> {
+    const result = await executeBuildStep(step, projectRoot);
+    if (!result.success) {
+        console.warn(`[devmode] ${stepLabel} failed on attempt 1, retrying in 10s...`);
+        await sendUpdate(`Retrying ${stepLabel}...`);
+        await new Promise((r) => setTimeout(r, 10_000));
+        return executeBuildStep(step, projectRoot);
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,13 +192,21 @@ export async function executeProjectRoadmap(
         console.info(`[devmode] ${phaseLabel} — executing`);
 
         try {
-            const result = await executeBuildStep(step, projectRoot);
+            const result = await executeBuildStepWithRetry(step, projectRoot, sendUpdate, phaseLabel);
 
             if (!result.success) {
                 let errDetail = result.error || result.stderr || "Unknown error";
                 const lowerErr = errDetail.toLowerCase();
                 if (lowerErr.includes("aider") && (lowerErr.includes("not found") || lowerErr.includes("command not found"))) {
                     errDetail += "\n\nTip: Install aider where the daemon runs (e.g. pip install aider-chat). Ensure the same PATH is used when the daemon runs build steps.";
+                }
+
+                if (step.optional) {
+                    jobPhases[i] = { ...jobPhases[i], status: "failed" };
+                    await updateJob(job.id, { phases: jobPhases });
+                    await sendUpdate(`Skipped optional step ${phaseLabel} (non-fatal, continuing build).`);
+                    console.warn(`[devmode] ${phaseLabel} SKIPPED (optional): ${errDetail.slice(0, 200)}`);
+                    continue;
                 }
 
                 jobPhases[i] = { ...jobPhases[i], status: "failed" };
@@ -215,6 +239,14 @@ export async function executeProjectRoadmap(
             console.info(`[devmode] ${phaseLabel} — done (exit ${result.exit_code})`);
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
+
+            if (step.optional) {
+                jobPhases[i] = { ...jobPhases[i], status: "failed" };
+                await updateJob(job.id, { phases: jobPhases });
+                await sendUpdate(`Skipped optional step ${phaseLabel} (exception, non-fatal, continuing build).`);
+                console.warn(`[devmode] ${phaseLabel} SKIPPED (optional exception):`, err);
+                continue;
+            }
 
             jobPhases[i] = { ...jobPhases[i], status: "failed" };
             await updateJob(job.id, {

@@ -1015,6 +1015,92 @@ def _handle_system_sleep(_payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# File discovery + Telegram file delivery
+# ---------------------------------------------------------------------------
+
+def _handle_find_file(payload: dict) -> dict:
+    """Search for files by name pattern and/or recency across ALLOWED_WORKSPACES."""
+    name_pattern: str = payload.get("name_pattern", "").lower()
+    folder_path: str = payload.get("folder_path", "")
+    modified_within_days: float = payload.get("modified_within_days", 0)
+    max_results: int = min(payload.get("max_results", 20), 100)
+
+    if folder_path:
+        resolved = _require_allowed(folder_path)
+        if resolved is None:
+            return {"success": False, "error": f"Path not in ALLOWED_WORKSPACES: {folder_path}"}
+        search_roots = [Path(resolved)]
+    else:
+        search_roots = [Path(ws) for ws in ALLOWED_WORKSPACES if Path(ws).exists()]
+
+    cutoff: float = 0.0
+    if modified_within_days and modified_within_days > 0:
+        cutoff = time.time() - modified_within_days * 86400
+
+    results = []
+    for root in search_roots:
+        try:
+            for f in root.rglob("*"):
+                if not f.is_file():
+                    continue
+                if name_pattern and name_pattern not in f.name.lower():
+                    continue
+                stat = f.stat()
+                if cutoff and stat.st_mtime < cutoff:
+                    continue
+                results.append({
+                    "name": f.name,
+                    "path": str(f),
+                    "size_bytes": stat.st_size,
+                    "modified_ts": stat.st_mtime,
+                })
+        except PermissionError:
+            pass
+
+    results.sort(key=lambda x: x["modified_ts"], reverse=True)
+    results = results[:max_results]
+    return {"success": True, "count": len(results), "files": results}
+
+
+def _handle_send_file_to_telegram(payload: dict) -> dict:
+    """Read a local file and upload it to a Telegram chat via sendDocument / sendPhoto."""
+    file_path: str = payload.get("file_path", "")
+    chat_id: str = str(payload.get("chat_id", ""))
+    bot_token: str = payload.get("bot_token", "")
+    caption: str = payload.get("caption", "")
+
+    if not file_path or not chat_id or not bot_token:
+        return {"success": False, "error": "file_path, chat_id, and bot_token are required"}
+
+    resolved = _require_allowed(file_path)
+    if resolved is None:
+        return {"success": False, "error": f"Path not in ALLOWED_WORKSPACES: {file_path}"}
+
+    path = Path(resolved)
+    if not path.is_file():
+        return {"success": False, "error": f"File not found: {resolved}"}
+
+    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    is_image = path.suffix.lower() in image_exts
+    method = "sendPhoto" if is_image else "sendDocument"
+    field = "photo" if is_image else "document"
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+
+    try:
+        with open(resolved, "rb") as fh:
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption
+            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=60)
+        result = resp.json()
+        if result.get("ok"):
+            return {"success": True, "message": f"Sent: {path.name}"}
+        return {"success": False, "error": result.get("description", "Telegram API error")}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -1035,6 +1121,8 @@ HANDLERS: dict[str, Any] = {
     # File operations
     "list_folders": _handle_list_folders,
     "list_folder_contents": _handle_list_folder_contents,
+    "find_file": _handle_find_file,
+    "send_file_to_telegram": _handle_send_file_to_telegram,
     "read_file": _handle_read_file,
     "create_file": _handle_create_file,
     "create_files": _handle_create_files,

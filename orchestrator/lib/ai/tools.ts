@@ -1240,10 +1240,35 @@ export const systemLock = tool({
 });
 
 /**
- * Aggregate export used when wiring tools into generateText / streamText.
- * The keys of this object become the tool names available to the model.
+ * Tool: find_file
+ * ---------------
+ * Search for files by name pattern and/or recency across allowed workspaces.
  */
-export const aiTools = {
+export const findFile = tool({
+    description:
+        "Search for files on the local PC by name or recency. " +
+        "Use name_pattern to match filenames (substring). " +
+        "Use modified_within_days to find recent files (e.g. 1 for yesterday's files). " +
+        "Use folder_path to narrow the search to a specific directory.",
+    inputSchema: z.object({
+        name_pattern: z.string().optional().describe("Filename substring to match (case-insensitive). Leave empty to match all files."),
+        folder_path: z.string().optional().describe("Absolute path of folder to search in. Leave empty to search all allowed workspaces."),
+        modified_within_days: z.number().optional().describe("Only return files modified within this many days (e.g. 1 = last 24 hours)."),
+        max_results: z.number().optional().describe("Max number of results to return. Defaults to 20."),
+    }),
+    async execute(args): Promise<unknown> {
+        try {
+            return await callWorker("find_file", args);
+        } catch (e) {
+            return { error: e instanceof Error ? e.message : "Worker error finding file." };
+        }
+    },
+});
+
+/**
+ * Aggregate export — base tools that don't need caller context.
+ */
+const baseAiTools = {
     search_local_codebase: searchLocalCodebase,
     create_file: createFile,
     batch_create_files: batchCreateFiles,
@@ -1265,6 +1290,7 @@ export const aiTools = {
     run_tests: runTests,
     run_scaffold: runScaffold,
     delete_path: deletePath,
+    find_file: findFile,
     spotify_play: spotifyPlay,
     spotify_pause: spotifyPause,
     spotify_next: spotifyNext,
@@ -1278,5 +1304,44 @@ export const aiTools = {
     system_lock: systemLock,
 };
 
-export type AiTools = typeof aiTools;
+/**
+ * Factory: returns all tools, including sender-aware tools like send_file_to_telegram.
+ * Pass the caller's senderId (Telegram chat ID) to enable file delivery.
+ */
+export function makeAiTools(senderId: string) {
+    const sendFileToTelegram = tool({
+        description:
+            "Send a file from the local PC to the user's Telegram chat. " +
+            "Use find_file first to get the exact file path. " +
+            "Supports images (jpg, png, gif, webp) and any other file type.",
+        inputSchema: z.object({
+            file_path: z.string().describe("Absolute path to the file to send."),
+            caption: z.string().optional().describe("Optional caption displayed under the file."),
+        }),
+        async execute({ file_path, caption }: { file_path: string; caption?: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set in environment." };
+            try {
+                return await callWorker("send_file_to_telegram", {
+                    file_path,
+                    chat_id: senderId,
+                    bot_token: botToken,
+                    caption: caption ?? "",
+                });
+            } catch (e) {
+                return { error: e instanceof Error ? e.message : "Worker error sending file." };
+            }
+        },
+    });
+
+    return {
+        ...baseAiTools,
+        send_file_to_telegram: sendFileToTelegram,
+    };
+}
+
+/** Convenience alias for call sites that don't need sender-aware tools. */
+export const aiTools = baseAiTools;
+
+export type AiTools = ReturnType<typeof makeAiTools>;
 
