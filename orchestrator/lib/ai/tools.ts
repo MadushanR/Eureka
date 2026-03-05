@@ -12,17 +12,25 @@
 import { tool } from "ai";
 import { z } from "zod";
 import type { InteractiveButton, StandardResponse } from "@/types/messaging";
-import { stagePatch, stagePush, stagePushOnly } from "@/lib/redis";
+import { stagePatch, stagePush, stagePushOnly, pushHostCommand, pollResult } from "@/lib/redis";
 
-const LOCAL_DAEMON_BASE = () => process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
+/**
+ * Push an action to the Redis host-command queue and wait for the result.
+ * Replaces all direct HTTP calls to LOCAL_DAEMON_URL.
+ */
+async function callWorker(
+    action: string,
+    payload: Record<string, unknown>,
+    timeoutMs = 30_000,
+): Promise<unknown> {
+    const taskId = await pushHostCommand(action, payload);
+    return pollResult(taskId, timeoutMs);
+}
 
-/** Resolve a repo name (e.g. "Eureka") to an absolute workspace path via the daemon. Returns null if not found or daemon unavailable. */
+/** Resolve a repo name (e.g. "Eureka") to an absolute workspace path via the worker. Returns null if not found. */
 async function resolveRepoName(repoName: string): Promise<string | null> {
-    const base = LOCAL_DAEMON_BASE();
-    if (!base) return null;
     try {
-        const res = await fetch(`${base}/git/find-repos`, { method: "GET" });
-        const data = (await res.json().catch(() => ({}))) as { repos?: Array<{ name: string; path: string }> };
+        const data = (await callWorker("list_git_repos", {})) as { repos?: Array<{ name: string; path: string }> };
         const repos = data.repos ?? [];
         const name = repoName.trim().toLowerCase();
         const match = repos.find((r) => r.name.toLowerCase() === name);
@@ -32,35 +40,16 @@ async function resolveRepoName(repoName: string): Promise<string | null> {
     }
 }
 
-async function spotifyDaemonCall(
-    method: "GET" | "POST",
-    path: string,
-    body?: object,
+/** Route a Spotify or system control action through the worker queue. */
+async function workerCall(
+    action: string,
+    payload: Record<string, unknown> = {},
 ): Promise<{ success: boolean; message?: string; error?: string; [k: string]: unknown }> {
-    const base = LOCAL_DAEMON_BASE();
-    if (!base) {
-        return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-    }
-    const url = `${base}${path}`;
     try {
-        const res = await fetch(url, {
-            method,
-            headers: { "Content-Type": "application/json" },
-            ...(body && method === "POST" ? { body: JSON.stringify(body) } : {}),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-            return {
-                success: false,
-                error: (data as { detail?: string }).detail ?? `Daemon returned ${res.status}`,
-            };
-        }
-        return { ...data, success: (data as { success?: boolean }).success !== false };
+        const result = (await callWorker(action, payload)) as { success?: boolean; message?: string; error?: string; [k: string]: unknown };
+        return { ...result, success: result.success !== false };
     } catch (e) {
-        return {
-            success: false,
-            error: e instanceof Error ? e.message : "Failed to reach the daemon.",
-        };
+        return { success: false, error: e instanceof Error ? e.message : "Worker error." };
     }
 }
 
@@ -85,67 +74,11 @@ export const searchLocalCodebase = tool({
             .min(1, "Search query must not be empty.")
             .describe("Natural language description of what to search for in the codebase."),
     }),
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute({ query }: { query: string }): Promise<unknown> {
-        const baseUrl = process.env.LOCAL_DAEMON_URL;
-
-        if (!baseUrl) {
-            const message =
-                "LOCAL_DAEMON_URL is not configured. The local code search daemon is currently unavailable.";
-            console.error(
-                "[tools.search_local_codebase] Missing LOCAL_DAEMON_URL environment variable.",
-            );
-            return {
-                error: message,
-            };
-        }
-
-        const url = `${baseUrl.replace(/\/+$/, "")}/search`;
-
         try {
-            const response = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({ query }),
-            });
-
-            if (!response.ok) {
-                const bodyText = await response.text().catch(() => "<unreadable body>");
-                const errorMessage = `[tools.search_local_codebase] Daemon responded with ${response.status} ${response.statusText}`;
-
-                console.error(errorMessage, "Response body:", bodyText);
-
-                return {
-                    error: "The local code search daemon responded with an error.",
-                    status: response.status,
-                };
-            }
-
-            try {
-                const json = await response.json();
-                return json;
-            } catch (parseError) {
-                console.error(
-                    "[tools.search_local_codebase] Failed to parse daemon JSON response:",
-                    parseError,
-                );
-                return {
-                    error: "The local code search daemon returned invalid JSON.",
-                };
-            }
-        } catch (networkError) {
-            console.error(
-                "[tools.search_local_codebase] Failed to reach local daemon:",
-                networkError,
-            );
-
-            return {
-                error:
-                    "Failed to reach the local code search daemon. " +
-                    "Ensure your development machine is online and the tunnel is running.",
-            };
+            return await callWorker("search", { query });
+        } catch (e) {
+            return { error: e instanceof Error ? e.message : "Worker error during search." };
         }
     },
 });
@@ -164,68 +97,11 @@ export const listWorkspaceFolders = tool({
     inputSchema: z
         .object({})
         .describe("No arguments. Call this to get a list of workspace folders."),
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute(): Promise<unknown> {
-        const baseUrl = process.env.LOCAL_DAEMON_URL;
-
-        if (!baseUrl) {
-            console.error(
-                "[tools.list_workspace_folders] Missing LOCAL_DAEMON_URL environment variable.",
-            );
-            return {
-                error:
-                    "LOCAL_DAEMON_URL is not configured. The local daemon is currently unavailable.",
-            };
-        }
-
-        const url = `${baseUrl.replace(/\/+$/, "")}/list-folders`;
-
         try {
-            const response = await fetch(url, {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) {
-                const bodyText = await response.text().catch(() => "<unreadable body>");
-                console.error(
-                    "[tools.list_workspace_folders] Daemon responded with error:",
-                    response.status,
-                    response.statusText,
-                    bodyText,
-                );
-                return {
-                    error:
-                        "The local daemon responded with an error while listing folders. " +
-                        "Check the daemon logs for details.",
-                    status: response.status,
-                };
-            }
-
-            try {
-                return await response.json();
-            } catch (parseError) {
-                console.error(
-                    "[tools.list_workspace_folders] Failed to parse JSON response:",
-                    parseError,
-                );
-                return {
-                    error:
-                        "The local daemon returned invalid JSON for the folder listing request.",
-                };
-            }
-        } catch (networkError) {
-            console.error(
-                "[tools.list_workspace_folders] Failed to reach local daemon:",
-                networkError,
-            );
-            return {
-                error:
-                    "Failed to reach the local daemon to list folders. " +
-                    "Ensure your development machine is online and the daemon is running.",
-            };
+            return await callWorker("list_folders", {});
+        } catch (e) {
+            return { error: e instanceof Error ? e.message : "Worker error listing folders." };
         }
     },
 });
@@ -245,68 +121,11 @@ export const listGitRepos = tool({
     inputSchema: z
         .object({})
         .describe("No arguments. Call this to get a list of local git repositories."),
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute(): Promise<unknown> {
-        const baseUrl = process.env.LOCAL_DAEMON_URL;
-
-        if (!baseUrl) {
-            console.error(
-                "[tools.list_git_repos] Missing LOCAL_DAEMON_URL environment variable.",
-            );
-            return {
-                error:
-                    "LOCAL_DAEMON_URL is not configured. The local daemon is currently unavailable.",
-            };
-        }
-
-        const base = baseUrl.replace(/\/+$/, "");
-        const url = `${base}/git/find-repos`;
-
         try {
-            const response = await fetch(url, {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) {
-                const bodyText = await response.text().catch(() => "<unreadable body>");
-                console.error(
-                    "[tools.list_git_repos] Daemon responded with error:",
-                    response.status,
-                    response.statusText,
-                    bodyText,
-                );
-                return {
-                    error:
-                        "The local daemon responded with an error while scanning for git repositories. " +
-                        "Check the daemon logs for details.",
-                    status: response.status,
-                };
-            }
-
-            try {
-                return await response.json();
-            } catch (parseError) {
-                console.error(
-                    "[tools.list_git_repos] Failed to parse JSON response:",
-                    parseError,
-                );
-                return {
-                    error: "The local daemon returned invalid JSON for the git repo listing request.",
-                };
-            }
-        } catch (networkError) {
-            console.error(
-                "[tools.list_git_repos] Failed to reach local daemon:",
-                networkError,
-            );
-            return {
-                error:
-                    "Failed to reach the local daemon to list git repositories. " +
-                    "Ensure your development machine is online and the daemon is running.",
-            };
+            return await callWorker("list_git_repos", {});
+        } catch (e) {
+            return { error: e instanceof Error ? e.message : "Worker error listing git repos." };
         }
     },
 });
@@ -339,10 +158,13 @@ export const getUncommittedChanges = tool({
         workspace_path?: string;
         repo_name?: string;
     }): Promise<{ text: string } | { error: string }> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { error: "LOCAL_DAEMON_URL is not configured." };
-        }
+        type DiffData = {
+            success?: boolean;
+            message?: string;
+            has_changes?: boolean;
+            diff?: string;
+            status_short?: string;
+        };
 
         let resolvedPath = workspace_path?.trim();
         if (repo_name?.trim() && !resolvedPath) {
@@ -354,50 +176,29 @@ export const getUncommittedChanges = tool({
         const maxDiffLen = 3200;
         const maxDiffLenAllRepos = 1200;
 
-        type DiffData = {
-            success?: boolean;
-            message?: string;
-            has_changes?: boolean;
-            diff?: string;
-            status_short?: string;
-        };
-
-        async function fetchDiff(path: string): Promise<DiffData> {
-            const url = `${base}/git/uncommitted-diff?${new URLSearchParams({ workspace_path: path }).toString()}`;
-            const res = await fetch(url, { method: "GET" });
-            return (await res.json().catch(() => ({}))) as DiffData;
-        }
-
         if (resolvedPath) {
-            const data = await fetchDiff(resolvedPath);
+            const data = (await callWorker("uncommitted_diff", { workspace_path: resolvedPath }).catch(() => ({}))) as DiffData;
             if (!data.success) {
                 return { error: data.message ?? "Could not get repo status." };
             }
             if (!data.has_changes) {
-                return {
-                    text: `**${resolvedPath}**\n\nNo uncommitted changes. Working tree clean.`,
-                };
+                return { text: `**${resolvedPath}**\n\nNo uncommitted changes. Working tree clean.` };
             }
             const diff = (data.diff ?? "").trim();
             const statusShort = (data.status_short ?? "").trim();
-            const truncated = diff.length > maxDiffLen;
-            const diffText = truncated ? diff.slice(0, maxDiffLen) + "\n\n… (truncated)" : diff;
+            const diffText = diff.length > maxDiffLen ? diff.slice(0, maxDiffLen) + "\n\n… (truncated)" : diff;
             return {
                 text:
                     `**${resolvedPath}**\n\n` +
                     (statusShort ? `Status: ${statusShort}\n\n` : "") +
-                    "Uncommitted changes:\n\n```\n" +
-                    diffText +
-                    "\n```",
+                    "Uncommitted changes:\n\n```\n" + diffText + "\n```",
             };
         }
 
         // All repos: list repos then fetch diff for each.
-        const listUrl = `${base}/git/find-repos`;
         let repos: Array<{ name: string; path: string }>;
         try {
-            const listRes = await fetch(listUrl, { method: "GET" });
-            const listData = (await listRes.json().catch(() => ({}))) as { repos?: Array<{ name: string; path: string }> };
+            const listData = (await callWorker("list_git_repos", {})) as { repos?: Array<{ name: string; path: string }> };
             repos = listData.repos ?? [];
         } catch {
             return { error: "Failed to list git repositories." };
@@ -408,7 +209,7 @@ export const getUncommittedChanges = tool({
 
         const sections: string[] = [];
         for (const repo of repos) {
-            const data = await fetchDiff(repo.path);
+            const data = (await callWorker("uncommitted_diff", { workspace_path: repo.path }).catch(() => ({}))) as DiffData;
             if (!data.success) {
                 sections.push(`**${repo.name}** (${repo.path})\n\nError: ${data.message ?? "Could not get status."}\n`);
                 continue;
@@ -419,19 +220,14 @@ export const getUncommittedChanges = tool({
             }
             const diff = (data.diff ?? "").trim();
             const statusShort = (data.status_short ?? "").trim();
-            const truncated = diff.length > maxDiffLenAllRepos;
-            const diffText = truncated ? diff.slice(0, maxDiffLenAllRepos) + "\n\n… (truncated)" : diff;
+            const diffText = diff.length > maxDiffLenAllRepos ? diff.slice(0, maxDiffLenAllRepos) + "\n\n… (truncated)" : diff;
             sections.push(
                 `**${repo.name}** (${repo.path})\n\n` +
                     (statusShort ? `Status: ${statusShort}\n\n` : "") +
-                    "```\n" +
-                    diffText +
-                    "\n```\n",
+                    "```\n" + diffText + "\n```\n",
             );
         }
-        return {
-            text: "Summary for all git repos:\n\n" + sections.join("\n---\n\n"),
-        };
+        return { text: "Summary for all git repos:\n\n" + sections.join("\n---\n\n") };
     },
 });
 
@@ -453,71 +249,11 @@ export const listFolderContents = tool({
                     'For example: "C:\\\\Users\\\\madus\\\\Desktop\\\\Capestone".',
             ),
     }),
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute({ folder_path }: { folder_path: string }): Promise<unknown> {
-        const baseUrl = process.env.LOCAL_DAEMON_URL;
-
-        if (!baseUrl) {
-            console.error(
-                "[tools.list_folder_contents] Missing LOCAL_DAEMON_URL environment variable.",
-            );
-            return {
-                error:
-                    "LOCAL_DAEMON_URL is not configured. The local daemon is currently unavailable.",
-            };
-        }
-
-        const base = baseUrl.replace(/\/+$/, "");
-        const url = `${base}/list-folder-contents?${new URLSearchParams({
-            folder_path,
-        }).toString()}`;
-
         try {
-            const response = await fetch(url, {
-                method: "GET",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-            });
-
-            if (!response.ok) {
-                const bodyText = await response.text().catch(() => "<unreadable body>");
-                console.error(
-                    "[tools.list_folder_contents] Daemon responded with error:",
-                    response.status,
-                    response.statusText,
-                    bodyText,
-                );
-                return {
-                    error:
-                        "The local daemon responded with an error while listing folder contents. " +
-                        "Check the daemon logs for details.",
-                    status: response.status,
-                };
-            }
-
-            try {
-                return await response.json();
-            } catch (parseError) {
-                console.error(
-                    "[tools.list_folder_contents] Failed to parse JSON response:",
-                    parseError,
-                );
-                return {
-                    error:
-                        "The local daemon returned invalid JSON for the folder contents request.",
-                };
-            }
-        } catch (networkError) {
-            console.error(
-                "[tools.list_folder_contents] Failed to reach local daemon:",
-                networkError,
-            );
-            return {
-                error:
-                    "Failed to reach the local daemon to list folder contents. " +
-                    "Ensure your development machine is online and the daemon is running.",
-            };
+            return await callWorker("list_folder_contents", { folder_path });
+        } catch (e) {
+            return { error: e instanceof Error ? e.message : "Worker error listing folder." };
         }
     },
 });
@@ -563,29 +299,16 @@ export const readFile = tool({
         start_line?: number;
         end_line?: number;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         try {
-            const body: Record<string, unknown> = { path: path.trim() };
-            if (start_line != null) body.start_line = start_line;
-            if (end_line != null) body.end_line = end_line;
-            const res = await fetch(`${base}/read-file`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
+            const payload: Record<string, unknown> = { path: path.trim() };
+            if (start_line != null) payload.start_line = start_line;
+            if (end_line != null) payload.end_line = end_line;
+            const data = (await callWorker("read_file", payload)) as {
                 success?: boolean;
-                path?: string;
                 content?: string;
                 total_lines?: number;
                 error?: string;
             };
-            if (!res.ok) {
-                return { success: false, error: data.error ?? `Daemon returned ${res.status}` };
-            }
             // Auto-truncate for the LLM context window
             if (data.content && data.content.length > READ_FILE_MAX_CHARS) {
                 const head = data.content.slice(0, 2000);
@@ -597,7 +320,7 @@ export const readFile = tool({
             }
             return data;
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error reading file." };
         }
     },
 });
@@ -632,38 +355,10 @@ export const runTests = tool({
         workspace_path: string;
         command_line: string;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         try {
-            const res = await fetch(`${base}/run-command`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: workspace_path.trim(),
-                    command_line: command_line.trim(),
-                }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                stdout?: string;
-                stderr?: string;
-                exit_code?: number;
-                error?: string;
-            };
-            if (!res.ok) {
-                return {
-                    success: false,
-                    error: data.error ?? `Daemon returned ${res.status}`,
-                };
-            }
-            return data;
+            return await callWorker("run_command", { workspace_path: workspace_path.trim(), command_line: command_line.trim() });
         } catch (e) {
-            return {
-                success: false,
-                error: e instanceof Error ? e.message : "Failed to reach the daemon.",
-            };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error running command." };
         }
     },
 });
@@ -697,32 +392,10 @@ export const runScaffold = tool({
         workspace_path: string;
         command_line: string;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         try {
-            const res = await fetch(`${base}/run-scaffold`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: workspace_path.trim(),
-                    command_line: command_line.trim(),
-                }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                stdout?: string;
-                stderr?: string;
-                exit_code?: number;
-                error?: string;
-            };
-            if (!res.ok) {
-                return { success: false, error: data.error ?? `Daemon returned ${res.status}` };
-            }
-            return data;
+            return await callWorker("run_scaffold", { workspace_path: workspace_path.trim(), command_line: command_line.trim() }, 300_000);
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error running scaffold." };
         }
     },
 });
@@ -766,36 +439,15 @@ export const createFile = tool({
         file_path: string;
         content: string;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
         const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         let workspace = workspace_path?.trim();
-        if (!workspace && repo_name) {
-            workspace = (await resolveRepoName(repo_name)) ?? undefined;
-        }
+        if (!workspace && repo_name) workspace = (await resolveRepoName(repo_name)) ?? undefined;
         if (!workspace) workspace = DEFAULT_WORKSPACE;
-        if (!workspace) {
-            return { success: false, error: "Could not determine workspace." };
-        }
+        if (!workspace) return { success: false, error: "Could not determine workspace." };
         try {
-            const res = await fetch(`${base}/create-file`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ workspace_path: workspace, file_path, content }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                message?: string;
-                path?: string;
-            };
-            if (!res.ok || data.success === false) {
-                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
-            }
-            return data;
+            return await callWorker("create_file", { workspace_path: workspace, file_path, content });
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error creating file." };
         }
     },
 });
@@ -836,33 +488,15 @@ export const batchCreateFiles = tool({
         workspace_path?: string;
         files: Array<{ file_path: string; content: string }>;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         let workspace = workspace_path?.trim();
-        if (!workspace && repo_name) {
-            workspace = (await resolveRepoName(repo_name)) ?? undefined;
-        }
+        if (!workspace && repo_name) workspace = (await resolveRepoName(repo_name)) ?? undefined;
         if (!workspace) workspace = DEFAULT_WORKSPACE;
         if (!workspace) return { success: false, error: "Could not determine workspace." };
         try {
-            const res = await fetch(`${base}/create-files`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ workspace_path: workspace, files }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                results?: Array<{ file_path: string; success: boolean; message: string }>;
-                created?: number;
-                failed?: number;
-            };
-            if (!res.ok || data.success === false) {
-                return { success: false, error: `${data.failed ?? 0} file(s) failed.`, results: data.results };
-            }
-            return data;
+            return await callWorker("create_files", { workspace_path: workspace, files });
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error creating files." };
         }
     },
 });
@@ -899,23 +533,10 @@ export const githubCreateRepo = tool({
         description?: string;
         private?: boolean;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         try {
-            const res = await fetch(`${base}/github/create-repo`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name, description: description ?? "", private: isPrivate ?? false }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean; message?: string; html_url?: string; clone_url?: string; name?: string;
-            };
-            if (!res.ok || data.success === false) {
-                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
-            }
-            return data;
+            return await callWorker("github_create_repo", { name, description: description ?? "", private: isPrivate ?? false });
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error creating GitHub repo." };
         }
     },
 });
@@ -954,27 +575,14 @@ export const gitClone = tool({
         parent_directory?: string;
         folder_name?: string;
     }): Promise<unknown> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
         const parentDir = parent_directory?.trim() || process.env.LOCAL_DAEMON_WORKSPACE_PATH?.trim();
         if (!parentDir) return { success: false, error: "Could not determine parent directory. Set LOCAL_DAEMON_WORKSPACE_PATH." };
         try {
-            const body: Record<string, string> = { clone_url, parent_directory: parentDir };
-            if (folder_name) body.folder_name = folder_name;
-            const res = await fetch(`${base}/git/clone`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean; message?: string; local_path?: string;
-            };
-            if (!res.ok || data.success === false) {
-                return { success: false, error: data.message ?? `Daemon returned ${res.status}` };
-            }
-            return data;
+            const payload: Record<string, string> = { clone_url, parent_directory: parentDir };
+            if (folder_name) payload.folder_name = folder_name;
+            return await callWorker("git_clone", payload);
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error cloning repo." };
         }
     },
 });
@@ -1025,60 +633,28 @@ export const deleteCode = tool({
         file_path: string;
         search_term: string;
     }): Promise<StandardResponse> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { text: "LOCAL_DAEMON_URL is not configured." };
-        }
         const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         let workspace = workspace_path?.trim();
-        if (!workspace && repo_name) {
-            workspace = (await resolveRepoName(repo_name)) ?? undefined;
-        }
+        if (!workspace && repo_name) workspace = (await resolveRepoName(repo_name)) ?? undefined;
         if (!workspace) workspace = DEFAULT_WORKSPACE;
-        if (!workspace) {
-            return { text: "Could not determine workspace." };
-        }
+        if (!workspace) return { text: "Could not determine workspace." };
 
         try {
-            const res = await fetch(`${base}/edit/delete-block`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: workspace,
-                    file_path,
-                    search_term,
-                }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                message?: string;
-                patch?: string;
-                deleted_lines?: string;
+            const data = (await callWorker("edit_delete_block", { workspace_path: workspace, file_path, search_term })) as {
+                success?: boolean; message?: string; patch?: string; deleted_lines?: string;
             };
-            if (!res.ok || data.success === false) {
-                const err = data.message ?? `Daemon returned ${res.status}`;
-                return { text: `Delete failed: ${err}` };
-            }
+            if (data.success === false) return { text: `Delete failed: ${data.message ?? "Unknown error."}` };
             const patch = data.patch ?? "";
-            if (!patch) {
-                return { text: "Daemon reported success but returned no patch." };
-            }
-
+            if (!patch) return { text: "Worker reported success but returned no patch." };
             console.info("[tools.delete_code] Block to delete:\n", (data.deleted_lines ?? "").slice(0, 500));
-
             const patchId = await stagePatch(patch, workspace);
-            const buttons: ReadonlyArray<InteractiveButton> = [
-                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
-            ];
-
             const preview = (data.deleted_lines ?? "").slice(0, 500);
             return {
                 text: `I found the block to delete:\n\n\`\`\`\n${preview}\n\`\`\`\n\nPress **Approve & Apply** to remove it.`,
-                interactiveButtons: buttons,
+                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
             };
         } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return { text: `Failed to reach daemon: ${msg}` };
+            return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
         }
     },
 });
@@ -1132,58 +708,27 @@ export const insertCode = tool({
         after_line: number;
         new_code: string;
     }): Promise<StandardResponse> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { text: "LOCAL_DAEMON_URL is not configured. Cannot prepare a patch." };
-        }
         const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         let workspace = workspace_path?.trim();
-        if (!workspace && repo_name) {
-            workspace = (await resolveRepoName(repo_name)) ?? undefined;
-        }
+        if (!workspace && repo_name) workspace = (await resolveRepoName(repo_name)) ?? undefined;
         if (!workspace) workspace = DEFAULT_WORKSPACE;
-        if (!workspace) {
-            return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
-        }
+        if (!workspace) return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
 
         try {
-            const res = await fetch(`${base}/edit/insert-code`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: workspace,
-                    file_path,
-                    after_line,
-                    new_code,
-                }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                message?: string;
-                patch?: string;
+            const data = (await callWorker("edit_insert_code", { workspace_path: workspace, file_path, after_line, new_code })) as {
+                success?: boolean; message?: string; patch?: string;
             };
-            if (!res.ok || data.success === false) {
-                const err = data.message ?? `Daemon returned ${res.status}`;
-                return { text: `Patch computation failed: ${err}` };
-            }
+            if (data.success === false) return { text: `Patch computation failed: ${data.message ?? "Unknown error."}` };
             const patch = data.patch ?? "";
-            if (!patch) {
-                return { text: "Daemon reported success but returned no patch." };
-            }
-
-            console.info("[tools.insert_code] Patch computed by daemon:\n", patch.slice(0, 2000));
-
+            if (!patch) return { text: "Worker reported success but returned no patch." };
+            console.info("[tools.insert_code] Patch computed:\n", patch.slice(0, 2000));
             const patchId = await stagePatch(patch, workspace);
-            const buttons: ReadonlyArray<InteractiveButton> = [
-                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
-            ];
             return {
                 text: "I've prepared new code to add. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
-                interactiveButtons: buttons,
+                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
             };
         } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return { text: `Failed to reach daemon for patch computation: ${msg}` };
+            return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
         }
     },
 });
@@ -1237,58 +782,27 @@ export const editFile = tool({
         search_string: string;
         replace_string: string;
     }): Promise<StandardResponse> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { text: "LOCAL_DAEMON_URL is not configured. Cannot prepare a patch." };
-        }
         const DEFAULT_WORKSPACE = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         let workspace = workspace_path?.trim();
-        if (!workspace && repo_name) {
-            workspace = (await resolveRepoName(repo_name)) ?? undefined;
-        }
+        if (!workspace && repo_name) workspace = (await resolveRepoName(repo_name)) ?? undefined;
         if (!workspace) workspace = DEFAULT_WORKSPACE;
-        if (!workspace) {
-            return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
-        }
+        if (!workspace) return { text: "Could not determine workspace. Set LOCAL_DAEMON_WORKSPACE_PATH or pass workspace_path." };
 
         try {
-            const res = await fetch(`${base}/edit/compute-replace-patch`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: workspace,
-                    file_path,
-                    search_string,
-                    replace_string,
-                }),
-            });
-            const data = (await res.json().catch(() => ({}))) as {
-                success?: boolean;
-                message?: string;
-                patch?: string;
+            const data = (await callWorker("edit_replace", { workspace_path: workspace, file_path, search_string, replace_string })) as {
+                success?: boolean; message?: string; patch?: string;
             };
-            if (!res.ok || data.success === false) {
-                const err = data.message ?? `Daemon returned ${res.status}`;
-                return { text: `Patch computation failed: ${err}` };
-            }
+            if (data.success === false) return { text: `Patch computation failed: ${data.message ?? "Unknown error."}` };
             const patch = data.patch ?? "";
-            if (!patch) {
-                return { text: "Daemon reported success but returned no patch." };
-            }
-
-            console.info("[tools.edit_file] Patch computed by daemon:\n", patch.slice(0, 2000));
-
+            if (!patch) return { text: "Worker reported success but returned no patch." };
+            console.info("[tools.edit_file] Patch computed:\n", patch.slice(0, 2000));
             const patchId = await stagePatch(patch, workspace);
-            const buttons: ReadonlyArray<InteractiveButton> = [
-                { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
-            ];
             return {
                 text: "I've prepared a code change. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
-                interactiveButtons: buttons,
+                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
             };
         } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return { text: `Failed to reach daemon for patch computation: ${msg}` };
+            return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
         }
     },
 });
@@ -1396,22 +910,16 @@ export const removeLine = tool({
         if (!resolvedPath) {
             return { success: false, error: "Provide either workspace_path or repo_name." };
         }
-        const url = `${base}/edit/compute-remove-line-patch`;
         let data: { success?: boolean; message?: string; patch?: string };
         try {
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: resolvedPath,
-                    file_path: file_path.replace(/\\/g, "/"),
-                    line_number,
-                    ...(line_end != null ? { line_end } : {}),
-                }),
-            });
-            data = (await res.json().catch(() => ({}))) as typeof data;
+            data = (await callWorker("edit_remove_line", {
+                workspace_path: resolvedPath,
+                file_path: file_path.replace(/\\/g, "/"),
+                line_number,
+                ...(line_end != null ? { line_end } : {}),
+            })) as typeof data;
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error computing remove-line patch." };
         }
         if (!data.success) {
             return { success: false, error: data.message ?? "Could not compute patch." };
@@ -1483,22 +991,16 @@ export const removeLinesMatching = tool({
         if (!resolvedPath) {
             return { success: false, error: "Provide either workspace_path or repo_name." };
         }
-        const url = `${base}/edit/compute-remove-lines-matching-patch`;
         let data: { success?: boolean; message?: string; patch?: string; files_affected?: number };
         try {
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    workspace_path: resolvedPath,
-                    pattern,
-                    ...(file_path != null && file_path !== "" ? { file_path: file_path.replace(/\\/g, "/") } : {}),
-                    ...(path_glob != null && path_glob !== "" ? { path_glob } : {}),
-                }),
-            });
-            data = (await res.json().catch(() => ({}))) as typeof data;
+            data = (await callWorker("edit_remove_lines_matching", {
+                workspace_path: resolvedPath,
+                pattern,
+                ...(file_path != null && file_path !== "" ? { file_path: file_path.replace(/\\/g, "/") } : {}),
+                ...(path_glob != null && path_glob !== "" ? { path_glob } : {}),
+            })) as typeof data;
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error computing remove-lines patch." };
         }
         if (!data.success) {
             return { success: false, error: data.message ?? "Could not compute patch." };
@@ -1552,11 +1054,6 @@ export const preparePushApproval = tool({
         workspace_path: string;
         commit_message?: string;
     }): Promise<StandardResponse | { success: boolean; error: string }> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
-        const url = `${base}/git/uncommitted-diff?${new URLSearchParams({ workspace_path }).toString()}`;
         let data: {
             success?: boolean;
             message?: string;
@@ -1565,10 +1062,9 @@ export const preparePushApproval = tool({
             status_short?: string;
         };
         try {
-            const res = await fetch(url, { method: "GET" });
-            data = (await res.json().catch(() => ({}))) as typeof data;
+            data = (await callWorker("uncommitted_diff", { workspace_path })) as typeof data;
         } catch (e) {
-            return { success: false, error: e instanceof Error ? e.message : "Failed to reach the daemon." };
+            return { success: false, error: e instanceof Error ? e.message : "Worker error getting diff." };
         }
         if (!data.success) {
             return { success: false, error: data.message ?? "Could not get repo status." };
@@ -1633,11 +1129,6 @@ export const preparePushOnlyApproval = tool({
     }: {
         workspace_path: string;
     }): Promise<StandardResponse | { success: boolean; error: string }> {
-        const base = LOCAL_DAEMON_BASE();
-        if (!base) {
-            return { success: false, error: "LOCAL_DAEMON_URL is not configured." };
-        }
-
         const pushOnlyId = await stagePushOnly(workspace_path);
         return {
             text:
@@ -1668,75 +1159,11 @@ export const deletePath = tool({
                 "Absolute path to the file or folder to delete. Must be inside an allowed workspace.",
             ),
     }),
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute({ path: pathToDelete }: { path: string }): Promise<unknown> {
-        const baseUrl = process.env.LOCAL_DAEMON_URL;
-
-        if (!baseUrl) {
-            console.error(
-                "[tools.delete_path] Missing LOCAL_DAEMON_URL environment variable.",
-            );
-            return {
-                success: false,
-                error: "LOCAL_DAEMON_URL is not configured. The local daemon is currently unavailable.",
-            };
-        }
-
-        const url = `${baseUrl.replace(/\/+$/, "")}/delete-path`;
-
         try {
-            const response = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({ path: pathToDelete }),
-            });
-
-            if (!response.ok) {
-                const bodyText = await response.text().catch(() => "<unreadable body>");
-                console.error(
-                    "[tools.delete_path] Daemon responded with error:",
-                    response.status,
-                    response.statusText,
-                    bodyText,
-                );
-                try {
-                    const errJson = JSON.parse(bodyText);
-                    return {
-                        success: false,
-                        error: errJson.detail ?? `Daemon error: ${response.status}`,
-                    };
-                } catch {
-                    return {
-                        success: false,
-                        error: `The daemon responded with ${response.status}. ${bodyText.slice(0, 200)}`,
-                    };
-                }
-            }
-
-            try {
-                return await response.json();
-            } catch (parseError) {
-                console.error(
-                    "[tools.delete_path] Failed to parse JSON response:",
-                    parseError,
-                );
-                return {
-                    success: false,
-                    error: "The local daemon returned invalid JSON.",
-                };
-            }
-        } catch (networkError) {
-            console.error(
-                "[tools.delete_path] Failed to reach local daemon:",
-                networkError,
-            );
-            return {
-                success: false,
-                error:
-                    "Failed to reach the local daemon. Ensure your machine is online and the daemon is running.",
-            };
+            return await callWorker("delete_path", { path: pathToDelete });
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Worker error deleting path." };
         }
     },
 });
@@ -1748,104 +1175,76 @@ export const deletePath = tool({
 export const spotifyPlay = tool({
     description: "Start or resume Spotify playback on the user's active device.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/play");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_play"); },
 });
 
 export const spotifyPause = tool({
     description: "Pause Spotify playback.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/pause");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_pause"); },
 });
 
 export const spotifyNext = tool({
     description: "Skip to the next Spotify track.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/next");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_next"); },
 });
 
 export const spotifyPrevious = tool({
     description: "Skip to the previous Spotify track.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/previous");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_previous"); },
 });
 
 export const spotifyVolume = tool({
     description: "Set Spotify volume. Use when the user asks to turn volume up/down or set a specific level.",
     inputSchema: z.object({
-        volume_percent: z
-            .number()
-            .min(0)
-            .max(100)
-            .describe("Volume level from 0 to 100."),
+        volume_percent: z.number().min(0).max(100).describe("Volume level from 0 to 100."),
     }),
     async execute({ volume_percent }: { volume_percent: number }): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/volume", { volume_percent });
+        return workerCall("spotify_volume", { volume_percent });
     },
 });
 
 export const spotifyStatus = tool({
     description: "Get current Spotify playback status (what's playing, device, etc.).",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("GET", "/spotify/status");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_status"); },
 });
 
 export const spotifyClose = tool({
     description:
         "Close or quit the Spotify desktop app on the user's PC. Use when the user asks to close Spotify, exit Spotify, or stop the Spotify app.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/spotify/close");
-    },
+    async execute(): Promise<unknown> { return workerCall("spotify_close"); },
 });
 
 // ---------------------------------------------------------------------------
-// System control (shutdown, sleep, restart) — via daemon on user's PC
+// System control (shutdown, sleep, restart, lock) — via worker on user's PC
 // ---------------------------------------------------------------------------
 
 export const systemShutdown = tool({
-    description:
-        "Shut down the user's PC. Use when the user asks to shut down, turn off, or power off their computer.",
+    description: "Shut down the user's PC. Use when the user asks to shut down, turn off, or power off their computer.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/system/shutdown");
-    },
+    async execute(): Promise<unknown> { return workerCall("system_shutdown"); },
 });
 
 export const systemRestart = tool({
-    description:
-        "Restart the user's PC. Use when the user asks to restart or reboot their computer.",
+    description: "Restart the user's PC. Use when the user asks to restart or reboot their computer.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/system/restart");
-    },
+    async execute(): Promise<unknown> { return workerCall("system_restart"); },
 });
 
 export const systemSleep = tool({
-    description:
-        "Put the user's PC to sleep (suspend). Use when the user asks to put the computer to sleep.",
+    description: "Put the user's PC to sleep (suspend). Use when the user asks to put the computer to sleep.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/system/sleep");
-    },
+    async execute(): Promise<unknown> { return workerCall("system_sleep"); },
 });
 
 export const systemLock = tool({
-    description:
-        "Lock the user's PC (lock screen, like Win+L). Use when the user asks to lock their computer or lock the screen.",
+    description: "Lock the user's PC (lock screen, like Win+L). Use when the user asks to lock their computer or lock the screen.",
     inputSchema: z.object({}),
-    async execute(): Promise<unknown> {
-        return spotifyDaemonCall("POST", "/system/lock");
-    },
+    async execute(): Promise<unknown> { return workerCall("system_lock"); },
 });
 
 /**

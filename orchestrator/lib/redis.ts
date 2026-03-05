@@ -561,3 +561,113 @@ export async function setResearchCancelled(senderId: string): Promise<void> {
         console.error(`[redis] setResearchCancelled failed:`, error instanceof Error ? error.message : error);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Host command queue (async pull architecture)
+// ---------------------------------------------------------------------------
+
+/**
+ * The Redis list key that the bare-metal Python worker BLPOPs from.
+ */
+export const TASK_QUEUE_KEY = "eureka:host_commands";
+
+/**
+ * Options for pushHostCommand.
+ *
+ * - `senderId` / `botToken`: Set these for **fire-and-forget** tasks where the
+ *   worker should send the Telegram reply directly.  When set, no `reply_to`
+ *   key is added to the task, so `pollResult` should not be called.
+ *
+ * - `async: true`: Explicit opt-in to fire-and-forget mode (implied when
+ *   senderId is provided).
+ *
+ * Without any of these options the task is a **request/response** task: the
+ * caller should await `pollResult(taskId)` to get the worker's answer.
+ */
+export interface HostCommandOptions {
+    senderId?: string;
+    botToken?: string;
+    async?: boolean;
+}
+
+/**
+ * Push a host command task onto the Redis queue.
+ *
+ * Returns the generated `taskId`.  For synchronous tasks (no `senderId`/
+ * `async:true`) the task JSON includes a `reply_to` key pointing to
+ * `eureka:result:{taskId}` so the worker knows where to publish its result.
+ *
+ * @param action  - Identifier for the operation the worker should perform.
+ * @param payload - Action-specific data object.
+ * @param options - Optional async/callback metadata.
+ */
+export async function pushHostCommand(
+    action: string,
+    payload: Record<string, unknown>,
+    options: HostCommandOptions = {}
+): Promise<string> {
+    const taskId = Math.random().toString(36).slice(2, 10);
+    const isAsync = options.async === true || options.senderId != null;
+    const replyTo = isAsync ? undefined : `eureka:result:${taskId}`;
+
+    const task: Record<string, unknown> = {
+        task_id: taskId,
+        action,
+        payload,
+    };
+    if (replyTo) task.reply_to = replyTo;
+    if (options.senderId) task.sender_id = options.senderId;
+    if (options.botToken) task.bot_token = options.botToken;
+
+    try {
+        await getRedisClient().lpush(TASK_QUEUE_KEY, JSON.stringify(task));
+    } catch (error) {
+        console.error(`[redis] pushHostCommand failed (action=${action}):`, error instanceof Error ? error.message : error);
+        throw error;
+    }
+
+    return taskId;
+}
+
+/**
+ * Poll `eureka:result:{taskId}` until the worker publishes a result or we
+ * exceed `timeoutMs`.
+ *
+ * Uses exponential backoff (300 ms → 600 ms → … capped at 30 s) to avoid
+ * hammering Upstash during long-running build steps.
+ *
+ * Deletes the result key after reading it (one-shot delivery).
+ *
+ * @throws {Error} if the worker does not respond within `timeoutMs`.
+ */
+export async function pollResult(
+    taskId: string,
+    timeoutMs: number = 30_000
+): Promise<unknown> {
+    const key = `eureka:result:${taskId}`;
+    const redis = getRedisClient();
+    const deadline = Date.now() + timeoutMs;
+    let delay = 300;
+
+    while (Date.now() < deadline) {
+        try {
+            const raw = await redis.get<string>(key);
+            if (raw !== null) {
+                await redis.del(key).catch(() => { /* best effort */ });
+                return typeof raw === "string" ? JSON.parse(raw) : raw;
+            }
+        } catch (error) {
+            console.error(`[redis] pollResult GET failed (taskId=${taskId}):`, error instanceof Error ? error.message : error);
+        }
+
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((r) => setTimeout(r, Math.min(delay, remaining)));
+        // Exponential backoff capped at 30 s (suitable for both fast tools and long build steps)
+        delay = Math.min(delay * 2, 30_000);
+    }
+
+    throw new Error(
+        `[redis] Worker did not respond within ${timeoutMs}ms for task ${taskId} (action may have timed out on the worker side).`
+    );
+}

@@ -12,9 +12,8 @@
  *   executeProjectRoadmap(plan, senderId, sendUpdate)
  */
 
-import { Agent, fetch as undiciFetch } from "undici";
 import type { ProjectPlan, BuildStep } from "./planner";
-import { createJob, updateJob, getJob, clearActiveJob, type DevJob, type DevJobPhase } from "@/lib/redis";
+import { createJob, updateJob, getJob, clearActiveJob, pushHostCommand, pollResult, type DevJob, type DevJobPhase } from "@/lib/redis";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,70 +45,31 @@ interface GitHubCreateRepoResult {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon helpers
+// Worker queue helpers
 // ---------------------------------------------------------------------------
-
-const daemonUrl = (): string =>
-    process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
 
 const workspacePath = (): string =>
     process.env.LOCAL_DAEMON_WORKSPACE_PATH?.replace(/\/+$/, "") ?? "C:/Users/madus/Desktop";
 
-/** Default fetch timeout for daemon calls (ms). Build steps use a longer timeout. */
-const DEFAULT_DAEMON_TIMEOUT_MS = 30_000;
-/** Timeout for /execute-build-step (daemon allows 600s per command). */
-const BUILD_STEP_TIMEOUT_MS = 620_000;
+/** Timeout for execute_build_step. Worker allows 600 s per command; accommodate multiple long commands. */
+const BUILD_STEP_TIMEOUT_MS = (() => {
+    const raw = process.env.BUILD_STEP_TIMEOUT_MS;
+    if (raw === undefined || raw === "") return 1_800_000; // 30 min default
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 1_800_000;
+})();
 
-async function callDaemon<T>(
-    endpoint: string,
-    body: Record<string, unknown>,
-    timeoutMs: number = DEFAULT_DAEMON_TIMEOUT_MS,
+/**
+ * Push an action onto the Redis host-command queue and wait for the result.
+ * Replaces the old HTTP `callDaemon()` — no tunnel required.
+ */
+async function callWorker<T>(
+    action: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number = 30_000,
 ): Promise<T> {
-    const base = daemonUrl();
-    if (!base) {
-        throw new Error(
-            "LOCAL_DAEMON_URL is not configured. Add it to .env.local (e.g. LOCAL_DAEMON_URL=http://127.0.0.1:8765) and ensure the daemon is running.",
-        );
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-    // Node's global fetch uses undici with ~300s default headersTimeout, which fires before
-    // long build steps complete. Use undici fetch with a custom Agent so our timeout is respected.
-    const dispatcher = new Agent({
-        headersTimeout: timeoutMs,
-        bodyTimeout: timeoutMs,
-        connectTimeout: Math.min(timeoutMs, 30_000),
-    });
-
-    try {
-        const res = await undiciFetch(`${base}${endpoint}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-            dispatcher,
-        });
-        clearTimeout(timeoutId);
-        if (!res.ok) {
-            const text = await res.text().catch(() => "(no body)");
-            throw new Error(`Daemon ${endpoint} returned ${res.status}: ${text}`);
-        }
-        return (await res.json()) as T;
-    } catch (err) {
-        clearTimeout(timeoutId);
-        if (err instanceof Error && err.name === "AbortError") {
-            throw new Error(
-                `Daemon ${endpoint} timed out after ${timeoutMs}ms. Check LOCAL_DAEMON_URL (${base}) and that the daemon is running.`,
-            );
-        }
-        const cause = err instanceof Error ? err.message : String(err);
-        throw new Error(
-            `Daemon request failed (${endpoint}): ${cause}. Check LOCAL_DAEMON_URL in .env.local and that the daemon is running at ${base}.`,
-            { cause: err instanceof Error ? err : undefined },
-        );
-    }
+    const taskId = await pushHostCommand(action, payload);
+    return (await pollResult(taskId, timeoutMs)) as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +85,8 @@ async function executeBuildStep(
             ? projectRoot
             : `${projectRoot}/${step.targetDirectory.replace(/^\/+/, "")}`;
 
-    return callDaemon<StepResult>(
-        "/execute-build-step",
+    return callWorker<StepResult>(
+        "execute_build_step",
         {
             workspace_path: targetDir,
             step_name: step.stepName,
@@ -146,7 +106,7 @@ async function createGitHubRepo(
     description: string,
     privateRepo: boolean = false,
 ): Promise<GitHubCreateRepoResult> {
-    return callDaemon<GitHubCreateRepoResult>("/github/create-repo", {
+    return callWorker<GitHubCreateRepoResult>("github_create_repo", {
         name,
         description: description.slice(0, 350),
         private: privateRepo,
@@ -158,11 +118,11 @@ async function gitPush(
     commitMessage: string,
     cloneUrl?: string,
 ): Promise<GitPushResult> {
-    return callDaemon<GitPushResult>("/git-push", {
+    return callWorker<GitPushResult>("git_push", {
         workspace_path: projectRoot,
         commit_message: commitMessage,
         ...(cloneUrl ? { clone_url: cloneUrl } : {}),
-    });
+    }, 300_000); // 5-minute timeout for git push
 }
 
 // ---------------------------------------------------------------------------

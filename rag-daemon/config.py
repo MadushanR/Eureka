@@ -157,6 +157,17 @@ class DaemonSettings(BaseSettings):
     """Personal Access Token with `repo` scope. Used by /github/create-repo."""
 
     # ------------------------------------------------------------------
+    # Aider / build steps (optional — if set, passed to aider when running build steps)
+    # ------------------------------------------------------------------
+
+    openai_api_key: Optional[str] = None
+    """
+    OpenAI API key injected into the environment when the daemon runs build-step
+    commands (e.g. aider). Set OPENAI_API_KEY in the daemon's .env so aider can
+    run non-interactively without a separate .aider.conf.yml.
+    """
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
 

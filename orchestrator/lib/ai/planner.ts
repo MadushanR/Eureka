@@ -84,7 +84,7 @@ const PLANNER_SYSTEM_PROMPT =
     "- Final step: ALWAYS a test / build verification step (npm run build, pytest, etc.).\n\n" +
     "Terminal command rules:\n" +
     "- Scaffold commands run HEADLESS (no terminal input). They must never prompt for user input.\n" +
-    "- create-next-app: add --yes and options, e.g. npx create-next-app@latest <name> --yes --ts --tailwind --eslint --app --use-npm.\n" +
+    "- create-next-app: use npx only (never 'npm create'). The directory argument MUST be '.' (scaffold in current directory). Never pass the project name as the directory — e.g. never 'npx create-next-app@latest food-demo-1 ...' as that creates project-name/project-name/ and conflicts on retry. Exact pattern: npx create-next-app@latest . --yes --ts --tailwind --eslint --app --use-npm with targetDirectory '.'.\n" +
     "- create-vite: pass --template (e.g. react-ts, vue-ts). With npm use: npm create vite@latest <name> -- --template react-ts. Optionally add --no-interactive.\n" +
     "- create-react-app: pass --template typescript (or template name), e.g. npx create-react-app <name> --template typescript.\n" +
     "- django-admin startproject/startapp: pass project name as argument; no extra flags needed.\n" +
@@ -94,7 +94,10 @@ const PLANNER_SYSTEM_PROMPT =
     '  aider --message "<DETAILED INSTRUCTIONS>" --yes --auto-commits\n' +
     "  The message must be self-contained and describe ALL files to create/edit and their full contents.\n" +
     "- For installs: npm install <pkg>, pip install <pkg>, etc.\n" +
-    "- For tests/builds: npm run build, npm test, pytest, etc.\n\n" +
+    "- For tests/builds: npm run build, npm test, pytest, etc.\n" +
+    "- Prisma: prisma init and prisma migrate must run in the SAME directory that contains the prisma/ folder. If a step's targetDirectory is a subdir (e.g. 'frontend'), run migrations from the directory where prisma/schema.prisma lives (targetDirectory '.'), or use --schema e.g. npx prisma migrate dev --name init --schema=../prisma/schema.prisma.\n" +
+    "- .env files: use double-quoted values for any value containing =, #, or spaces (e.g. DATABASE_URL=\"postgresql://user:pass@host/db\") so python-dotenv and other parsers do not fail.\n" +
+    "- Each terminal command runs with the step's targetDirectory as cwd; there is no shared shell (e.g. 'cd x' in command 1 does not change cwd for command 2). Use one command with 'cd x && ...' if you need to run in a subdir, or set targetDirectory for that step.\n\n" +
     "CRITICAL:\n" +
     "- Every command must be a real, runnable shell command — no pseudocode.\n" +
     "- targetDirectory is relative to the project root. Use '.' for root.\n" +

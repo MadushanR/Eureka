@@ -35,7 +35,6 @@ export const UserProfileSchema = z.object({
         .describe("Names or URLs of repos the user is actively working on."),
     awsRegion: z
         .string()
-        .default("")
         .describe("Preferred AWS region (e.g. us-east-1). Use empty string if unknown."),
     cloudProviders: z
         .array(z.string())
@@ -45,11 +44,9 @@ export const UserProfileSchema = z.object({
         .describe("Databases the user works with (e.g. PostgreSQL, Redis, DynamoDB)."),
     os: z
         .string()
-        .default("")
         .describe("Operating system (e.g. Windows 11, macOS Sonoma). Use empty string if unknown."),
     editor: z
         .string()
-        .default("")
         .describe("Primary code editor (e.g. Cursor, VS Code). Use empty string if unknown."),
     deploymentTargets: z
         .array(z.string())
@@ -97,7 +94,8 @@ export async function getUserProfile(userId: string): Promise<UserProfile> {
         if (!raw) return { ...EMPTY_PROFILE };
 
         const parsed: unknown = typeof raw === "string" ? JSON.parse(raw) : raw;
-        const result = UserProfileSchema.safeParse(parsed);
+        const withDefaults = typeof parsed === "object" && parsed !== null ? { ...EMPTY_PROFILE, ...parsed } : EMPTY_PROFILE;
+        const result = UserProfileSchema.safeParse(withDefaults);
         return result.success ? result.data : { ...EMPTY_PROFILE };
     } catch (error) {
         console.error(`[memory] getUserProfile failed for userId="${userId}":`, error);

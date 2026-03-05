@@ -43,7 +43,6 @@ import { countWords, parseResearchMessage, runResearchPipeline } from "@/lib/ai/
 import { shouldRunExtraction, updateUserProfile } from "@/lib/ai/memory";
 import { generateProjectRoadmap } from "@/lib/ai/planner";
 import { executeProjectRoadmap } from "@/lib/ai/executor";
-import { buildPushCompletionUrl } from "@/lib/pushCallback";
 import {
     getChatHistory,
     getPendingPatch,
@@ -56,6 +55,7 @@ import {
     setActiveResearch,
     clearActiveResearch,
     setResearchCancelled,
+    pushHostCommand,
 } from "@/lib/redis";
 import { ResearchCancelledError } from "@/lib/ai/researchAgents";
 
@@ -212,8 +212,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     //   import { waitUntil } from '@vercel/functions';
     //   waitUntil(processMessage(message));
 
-    // Fire-and-forget: kick off downstream processing in the background.
-    void processMessage(message);
+    // Extend the Vercel function lifetime so processMessage() is not killed
+    // the moment the HTTP response is sent.  Without waitUntil(), Vercel
+    // terminates the serverless function immediately after returning 200,
+    // which means no LLM calls, no Redis writes, no logs.
+    const messagePromise = processMessage(message);
+    try {
+        const { waitUntil } = await import("@vercel/functions");
+        waitUntil(messagePromise);
+    } catch {
+        // Not running on Vercel (local dev) — fire-and-forget is fine.
+        void messagePromise;
+    }
 
     return NextResponse.json({ ok: true }, { status: 200 });
 }
@@ -254,49 +264,22 @@ async function handleApplyPatchAction(message: StandardMessage): Promise<boolean
         return true;
     }
 
-    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
-    if (!daemonUrl) {
+    try {
+        // Push the patch task to the Redis queue.  The worker will apply the
+        // patch and send a Telegram notification directly when done.
+        await pushHostCommand(
+            "apply_patch",
+            { patch_string: staged.patch_string, workspace_path: workspacePath },
+            { senderId: message.senderId, botToken: process.env.TELEGRAM_BOT_TOKEN, async: true }
+        );
         await adapter.sendResponse(
-            { text: "LOCAL_DAEMON_URL is not configured. Cannot apply the patch." },
+            { text: "Patch queued. You'll receive a message once it's applied." },
             message.senderId
         );
-        return true;
-    }
-
-    try {
-        const res = await fetch(`${daemonUrl}/apply-patch`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                patch_string: staged.patch_string,
-                workspace_path: workspacePath,
-            }),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-            success?: boolean;
-            message?: string;
-            stdout?: string;
-            stderr?: string;
-        };
-
-        if (data.success) {
-            await adapter.sendResponse(
-                { text: `Patch applied successfully. ${data.message ?? ""}`.trim() },
-                message.senderId
-            );
-        } else {
-            const detail = [data.stdout, data.stderr].filter(Boolean).join("\n");
-            await adapter.sendResponse(
-                {
-                    text: `Patch could not be applied. ${data.message ?? "Unknown error."}${detail ? `\n\n${detail}` : ""}`,
-                },
-                message.senderId
-            );
-        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await adapter.sendResponse(
-            { text: `Failed to reach the daemon to apply the patch: ${msg}` },
+            { text: `Failed to queue the patch task: ${msg}` },
             message.senderId
         );
     }
@@ -326,63 +309,22 @@ async function handlePushAction(message: StandardMessage): Promise<boolean> {
         return true;
     }
 
-    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
-    if (!daemonUrl) {
+    try {
+        // Push the commit-and-push task to the Redis queue.  The worker will
+        // run the git operations and send a Telegram notification when done.
+        await pushHostCommand(
+            "git_commit_and_push",
+            { workspace_path: staged.workspace_path, commit_message: staged.commit_message },
+            { senderId: message.senderId, botToken: process.env.TELEGRAM_BOT_TOKEN, async: true }
+        );
         await adapter.sendResponse(
-            { text: "LOCAL_DAEMON_URL is not configured. Cannot push." },
+            { text: "Push queued. You'll receive a message once the commit and push complete." },
             message.senderId
         );
-        return true;
-    }
-
-    const completionUrl = buildPushCompletionUrl(message.senderId, "commit-and-push");
-
-    try {
-        const body: { workspace_path: string; commit_message: string; completion_webhook_url?: string } = {
-            workspace_path: staged.workspace_path,
-            commit_message: staged.commit_message,
-        };
-        if (completionUrl) body.completion_webhook_url = completionUrl;
-
-        const res = await fetch(`${daemonUrl}/git/commit-and-push`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-            success?: boolean;
-            message?: string;
-            stdout?: string;
-            stderr?: string;
-            started?: boolean;
-        };
-
-        if (res.status === 202 && data.started) {
-            await adapter.sendResponse(
-                { text: "Push started in the background. You'll get a message when it completes." },
-                message.senderId
-            );
-            return true;
-        }
-
-        if (data.success) {
-            await adapter.sendResponse(
-                { text: `Push completed. ${data.message ?? ""}`.trim() },
-                message.senderId
-            );
-        } else {
-            const detail = [data.stdout, data.stderr].filter(Boolean).join("\n");
-            await adapter.sendResponse(
-                {
-                    text: `Push failed. ${data.message ?? "Unknown error."}${detail ? `\n\n${detail}` : ""}`,
-                },
-                message.senderId
-            );
-        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await adapter.sendResponse(
-            { text: `Failed to reach the daemon to push: ${msg}` },
+            { text: `Failed to queue the push task: ${msg}` },
             message.senderId
         );
     }
@@ -412,62 +354,22 @@ async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> 
         return true;
     }
 
-    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
-    if (!daemonUrl) {
+    try {
+        // Push the push-only task to the Redis queue.  The worker will run
+        // git push and send a Telegram notification when done.
+        await pushHostCommand(
+            "git_push_only",
+            { workspace_path: staged.workspace_path },
+            { senderId: message.senderId, botToken: process.env.TELEGRAM_BOT_TOKEN, async: true }
+        );
         await adapter.sendResponse(
-            { text: "LOCAL_DAEMON_URL is not configured. Cannot push." },
+            { text: "Push queued. You'll receive a message once it completes." },
             message.senderId
         );
-        return true;
-    }
-
-    const completionUrl = buildPushCompletionUrl(message.senderId, "push-only");
-
-    try {
-        const body: { workspace_path: string; completion_webhook_url?: string } = {
-            workspace_path: staged.workspace_path,
-        };
-        if (completionUrl) body.completion_webhook_url = completionUrl;
-
-        const res = await fetch(`${daemonUrl}/git/push-only`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-            success?: boolean;
-            message?: string;
-            stdout?: string;
-            stderr?: string;
-            started?: boolean;
-        };
-
-        if (res.status === 202 && data.started) {
-            await adapter.sendResponse(
-                { text: "Push started in the background. You'll get a message when it completes." },
-                message.senderId
-            );
-            return true;
-        }
-
-        if (data.success) {
-            await adapter.sendResponse(
-                { text: `Push-only completed. ${data.message ?? ""}`.trim() },
-                message.senderId
-            );
-        } else {
-            const detail = [data.stdout, data.stderr].filter(Boolean).join("\n");
-            await adapter.sendResponse(
-                {
-                    text: `Push-only failed. ${data.message ?? "Unknown error."}${detail ? `\n\n${detail}` : ""}`,
-                },
-                message.senderId
-            );
-        }
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await adapter.sendResponse(
-            { text: `Failed to reach the daemon to push: ${msg}` },
+            { text: `Failed to queue the push-only task: ${msg}` },
             message.senderId
         );
     }
@@ -545,34 +447,23 @@ async function runResearchInBackground(
         console.info(`[telegram/webhook] Starting research pipeline for sender=${senderId}${targetWords != null ? ` (target: ${targetWords} words)` : ""}`);
         const result = await runResearchPipeline(topic, onProgress, getIsCancelled, { targetWords });
 
-        // Save paper as PDF on Desktop via daemon
-        const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
+        // Save paper as PDF on Desktop via the Redis worker queue.
         const workspacePath = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "C:/Users/madus/Desktop";
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const filename = `research-paper-${timestamp}.pdf`;
 
         let savedPath = "";
-        if (daemonUrl) {
-            try {
-                const saveRes = await fetch(`${daemonUrl}/save-markdown-as-pdf`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        workspace_path: workspacePath,
-                        filename,
-                        content: result.paper,
-                    }),
-                });
-                const saveData = (await saveRes.json().catch(() => ({}))) as { success?: boolean; path?: string; message?: string };
-                if (saveData.success) {
-                    savedPath = saveData.path ?? filename;
-                    console.info(`[telegram/webhook] Research paper saved as PDF: ${savedPath}`);
-                } else {
-                    console.warn(`[telegram/webhook] Failed to save paper as PDF: ${saveData.message}`);
-                }
-            } catch (e) {
-                console.error(`[telegram/webhook] Error saving research paper:`, e);
-            }
+        try {
+            // Fire-and-forget: worker saves the PDF and notifies via Telegram.
+            await pushHostCommand(
+                "save_markdown_as_pdf",
+                { workspace_path: workspacePath, filename, content: result.paper },
+                { senderId, botToken: process.env.TELEGRAM_BOT_TOKEN, async: true }
+            );
+            savedPath = `${workspacePath}/${filename}`;
+            console.info(`[telegram/webhook] Research PDF save queued: ${savedPath}`);
+        } catch (e) {
+            console.error(`[telegram/webhook] Error queuing research paper save:`, e);
         }
 
         const wordCount = countWords(result.paper);

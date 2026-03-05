@@ -3366,10 +3366,18 @@ def _run_build_command(cmd: str, cwd: str) -> subprocess.CompletedProcess[str]:
         timeout=600,
         stdin=subprocess.DEVNULL,
     )
+    # Inject OPENAI_API_KEY from daemon config so aider (and similar tools) get it automatically
+    env = os.environ.copy()
+    if getattr(settings, "openai_api_key", None):
+        env["OPENAI_API_KEY"] = settings.openai_api_key
+
     if sys.platform == "win32":
         bash_path = _get_windows_bash_path()
         if bash_path:
+            env["TERM"] = "dumb"
+            run_kw["env"] = env
             return subprocess.run([bash_path, "-c", cmd], **run_kw)
+    run_kw["env"] = env
     return subprocess.run(cmd, shell=True, **run_kw)
 
 

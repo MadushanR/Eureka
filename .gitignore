@@ -209,3 +209,4 @@ rag-daemon/chroma_db/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.aider*
