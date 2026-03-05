@@ -109,14 +109,19 @@ def _tg(chat_id: str, text: str, bot_token: str | None = None) -> None:
     token = bot_token or BOT_TOKEN
     if not token or not chat_id:
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4096]},
-            timeout=10,
-        )
-    except Exception as e:
-        log.warning("Telegram send failed: %s", e)
+    for attempt in range(3):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text[:4096]},
+                timeout=30,
+            )
+            return
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            else:
+                log.warning("Telegram send failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # Action handlers — strict dispatch (no arbitrary shell execution)
