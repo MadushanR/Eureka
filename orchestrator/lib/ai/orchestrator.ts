@@ -94,7 +94,7 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
     }
 
     // delete_path / Spotify: { success, message } or { success: false, error }
-    if (typeof obj.success === "boolean") {
+    if (typeof obj.success === "boolean" && !Array.isArray(obj.entries)) {
         if (obj.success && typeof obj.message === "string") {
             // Spotify status can include track info
             if (obj.track != null || obj.is_playing != null) {
@@ -114,10 +114,10 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
         return obj.success ? "Done." : "Failed.";
     }
 
-    // list_folder_contents: { folder_path, entries: [ { name, type } ] }
-    if (typeof obj.folder_path === "string" && Array.isArray(obj.entries)) {
+    // list_folder_contents: { success, path, entries: [ { name, type } ] }
+    if (Array.isArray(obj.entries) && typeof obj.path === "string") {
         const entries = obj.entries as Array<{ name?: string; type?: string }>;
-        const lines: string[] = [`Here are the items inside ${obj.folder_path}:`];
+        const lines: string[] = [`Here are the items inside ${obj.path}:`];
         if (entries.length === 0) {
             lines.push("  (folder is empty)");
         } else {
