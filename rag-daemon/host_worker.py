@@ -73,6 +73,11 @@ SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
 TASK_QUEUE = "eureka:host_commands"
+# URL of the Next.js orchestrator — used for streaming build callbacks.
+# e.g. "https://your-app.vercel.app" or "http://localhost:3000"
+ORCHESTRATOR_CALLBACK_URL = os.environ.get("ORCHESTRATOR_CALLBACK_URL", "")
+# How often (seconds) to flush the output buffer back to the orchestrator.
+_CLAUDE_STREAM_INTERVAL = 5.0
 
 if not REDIS_URL:
     log.error("UPSTASH_REDIS_URL is not set. Set it in .env and restart.")
@@ -122,6 +127,40 @@ def _tg(chat_id: str, text: str, bot_token: str | None = None) -> None:
                 time.sleep(2 ** attempt)
             else:
                 log.warning("Telegram send failed: %s", e)
+
+# ---------------------------------------------------------------------------
+# Streaming callback helper
+# ---------------------------------------------------------------------------
+
+def _post_worker_callback(
+    text: str,
+    sender_id: str,
+    task_id: str,
+    bot_token: str,
+    callback_url: str,
+) -> None:
+    """
+    POST a streaming chunk to the Next.js /api/worker-callback endpoint.
+    Falls back to direct Telegram delivery if no callback URL is configured.
+    """
+    if callback_url:
+        try:
+            requests.post(
+                f"{callback_url.rstrip('/')}/api/worker-callback",
+                json={
+                    "sender_id": sender_id,
+                    "task_id": task_id,
+                    "text": text,
+                    "bot_token": bot_token,
+                },
+                timeout=15,
+            )
+            return
+        except Exception as exc:
+            log.warning("[claude-stream] Callback POST failed (%s); falling back to Telegram.", exc)
+    # Fallback: send directly via Telegram
+    _tg(sender_id, text, bot_token)
+
 
 # ---------------------------------------------------------------------------
 # Action handlers — strict dispatch (no arbitrary shell execution)
@@ -581,7 +620,7 @@ def _handle_run_scaffold(payload: dict) -> dict:
 
 # --- Patch computation (edit tools) ------------------------------------------
 
-def _compute_patch(workspace_path: str, file_path: str, original: str, modified: str) -> dict:
+def _compute_patch(_workspace_path: str, file_path: str, original: str, modified: str) -> dict:
     """Generate a unified diff patch from original → modified."""
     norm = file_path.replace("\\", "/")
     diff_lines = list(difflib.unified_diff(
@@ -986,6 +1025,98 @@ def _handle_open_url(payload: dict) -> dict:
         return {"success": False, "message": str(e)}
 
 
+# PowerShell template for open_app.
+# Searches both Start Menu trees for a matching .lnk via a case-insensitive
+# glob (-like "*$name*"), then falls back to Start-Process which resolves
+# executables registered in the Windows App Paths registry (e.g. 'chrome',
+# 'code', 'spotify', 'excel').
+#
+# Note on escaping:
+#   - This is a raw Python string: every \ is a literal backslash in the PS source.
+#   - {{ and }} are Python .format() escapes that become { and } in the PS script.
+#   - {name} is the only Python format placeholder; $name and $(...) are PS-only.
+_PS_OPEN_APP = r"""
+$name = '{name}'
+$dirs = @(
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+)
+$shortcut = $dirs | ForEach-Object {{
+    if (Test-Path $_) {{
+        Get-ChildItem -Path $_ -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue
+    }}
+}} | Where-Object {{ $_.BaseName -like "*$name*" }} | Select-Object -First 1
+if ($shortcut) {{
+    Invoke-Item -Path $shortcut.FullName
+    Write-Output "Launched via shortcut: $($shortcut.BaseName)"
+}} else {{
+    try {{
+        Start-Process -FilePath '{name}' -ErrorAction Stop
+        Write-Output "Launched via App Paths: {name}"
+    }} catch {{
+        Write-Error "App not found: {name}"
+        exit 1
+    }}
+}}
+"""
+
+
+def _handle_open_app(payload: dict) -> dict:
+    """
+    Launch a Windows application by plain-English name.
+
+    Execution order:
+      1. Search both Start Menu trees ($env:ProgramData and $env:APPDATA) for a
+         .lnk file whose BaseName contains app_name (case-insensitive glob).
+         Launches the first match via Invoke-Item, which respects the shortcut's
+         target, working directory, and run-as settings.
+      2. If no shortcut is found, fall back to Start-Process <app_name>, which
+         resolves executables registered under HKLM\SOFTWARE\Microsoft\Windows\
+         CurrentVersion\App Paths (e.g. 'chrome', 'code', 'msedge', 'excel').
+
+    The PowerShell host process runs with -WindowStyle Hidden and -NonInteractive
+    so no console window flashes on screen.  The launched application itself
+    opens normally in its own window.
+
+    payload keys:
+      app_name (str, required) — partial or full name, e.g. "spotify", "VS Code".
+    """
+    if platform.system() != "Windows":
+        return {"success": False, "message": "open_app is Windows-only."}
+
+    app_name: str = payload.get("app_name", "").strip()
+    if not app_name:
+        return {"success": False, "message": "app_name is required."}
+
+    # Escape single quotes: the only injection vector inside a PS single-quoted
+    # string is an embedded single quote — doubled it becomes a literal quote.
+    safe = app_name.replace("'", "''")
+    ps_script = _PS_OPEN_APP.format(name=safe)
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-WindowStyle", "Hidden",
+                "-NonInteractive",
+                "-NoProfile",
+                "-Command", ps_script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,   # file-system search is fast; 15 s is generous
+        )
+        if result.returncode == 0:
+            msg = result.stdout.strip() or f"Launched: {app_name}"
+            return {"success": True, "message": msg}
+        err = result.stderr.strip() or result.stdout.strip() or f"PowerShell exit {result.returncode}"
+        return {"success": False, "message": err[:400]}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "message": f"Timed out searching for: {app_name}"}
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
 def _handle_system_lock(_payload: dict) -> dict:
     try:
         if platform.system() == "Windows":
@@ -1033,6 +1164,690 @@ def _handle_system_sleep(_payload: dict) -> dict:
         return {"success": True, "message": "Sleep initiated."}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _handle_lockdown_pc(_payload: dict) -> dict:
+    """
+    Hardware lockdown: mute audio, turn off monitors, then lock the workstation.
+    All three operations are executed silently via Win32 API / WASAPI COM — no
+    visible windows or console output.
+
+    Execution order:
+      1. Mute system audio (WASAPI SetMute — idempotent, always mutes).
+      2. Lock the workstation (LockWorkStation — async, posts to message queue).
+      3. Brief sleep to let the lock-screen render before the display goes dark.
+      4. Kill monitors (SendMessageW SC_MONITORPOWER 0xF170 / param 2 = off).
+    """
+    if platform.system() != "Windows":
+        return {"success": False, "error": "lockdown_pc is Windows-only."}
+
+    errors: list[str] = []
+
+    # 1. Mute system master volume via WASAPI (pycaw → comtypes COM).
+    #    SetMute(1, None) is idempotent — safe to call even when already muted.
+    try:
+        from ctypes import cast as ct_cast, POINTER
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        import comtypes
+        speakers = AudioUtilities.GetSpeakers()
+        interface = speakers.Activate(
+            IAudioEndpointVolume._iid_,
+            comtypes.CLSCTX_ALL,
+            None,
+        )
+        volume_ctrl = ct_cast(interface, POINTER(IAudioEndpointVolume))
+        volume_ctrl.SetMute(1, None)
+    except Exception as exc:
+        errors.append(f"mute failed: {exc}")
+
+    # 2. Lock the workstation.  Returns immediately; the actual lock is async.
+    try:
+        ctypes.windll.user32.LockWorkStation()
+    except Exception as exc:
+        errors.append(f"lock failed: {exc}")
+
+    # 3. Wait for the lock-screen to appear before cutting the display signal.
+    time.sleep(0.75)
+
+    # 4. Cut power to all connected monitors (value 2 = off; 1 = low-power/standby).
+    #    HWND_BROADCAST (0xFFFF) ensures every top-level window receives the message,
+    #    which in practice causes the driver to power-off all attached displays.
+    try:
+        HWND_BROADCAST  = 0xFFFF
+        WM_SYSCOMMAND   = 0x0112
+        SC_MONITORPOWER = 0xF170
+        MONITOR_OFF     = 2
+        ctypes.windll.user32.SendMessageW(
+            HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF
+        )
+    except Exception as exc:
+        errors.append(f"monitor off failed: {exc}")
+
+    if errors:
+        return {
+            "success": False,
+            "message": "Lockdown partially applied.",
+            "errors": errors,
+        }
+    return {"success": True, "message": "PC locked, audio muted, monitors off."}
+
+
+# --- Remote task manager -----------------------------------------------------
+
+# Process names that must never be killed — doing so can crash or blue-screen
+# the OS.  psutil.AccessDenied will catch most of these at runtime anyway, but
+# an explicit blocklist gives a clean, user-readable rejection message.
+_PROTECTED_PROCESSES: frozenset[str] = frozenset({
+    "system", "registry", "idle",
+    "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+    "lsass.exe", "services.exe", "svchost.exe",
+    "dwm.exe", "fontdrvhost.exe", "sihost.exe", "taskhostw.exe",
+    "spoolsv.exe", "audiodg.exe", "ntoskrnl.exe",
+})
+
+
+def _get_windowed_pids() -> set[int]:
+    """
+    Return PIDs of processes that own at least one visible, titled desktop
+    window (i.e. the kind that shows up on the taskbar).
+
+    Filtering rules:
+    - Window must be visible (IsWindowVisible).
+    - Window must have a non-empty title.
+    - Window must NOT be a tool-window (WS_EX_TOOLWINDOW), which covers
+      system trays, floating helpers, and other off-taskbar chrome.
+    """
+    pids: set[int] = set()
+    try:
+        import win32gui
+        import win32process
+        import win32con
+
+        def _callback(hwnd: int, _: object) -> bool:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if not win32gui.GetWindowTextLength(hwnd):
+                return True
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if ex_style & win32con.WS_EX_TOOLWINDOW:
+                return True
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                pids.add(pid)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_callback, None)
+    except ImportError:
+        pass  # pywin32 not installed; callers fall back to resource-only list
+    return pids
+
+
+def _handle_list_apps(_payload: dict) -> dict:
+    """
+    Return a human-readable list of user-facing processes: those with a
+    visible desktop window (tag [W]) OR the top resource hogs by RAM / CPU
+    (tag [R]).  Background noise (hundreds of svchost.exe, etc.) is excluded.
+
+    Output is formatted as one line per process so it renders cleanly in
+    a Telegram message.
+    """
+    try:
+        windowed_pids = _get_windowed_pids()
+
+        # Snapshot every process once to avoid repeated per-process syscalls.
+        # cpu_percent on first call always returns 0.0 — that's acceptable here
+        # since we primarily sort by RAM and use CPU as a secondary signal.
+        all_procs: list[dict] = []
+        for proc in psutil.process_iter(["pid", "name", "memory_info", "cpu_percent", "status"]):
+            try:
+                info = proc.info
+                if info["status"] == psutil.STATUS_ZOMBIE:
+                    continue
+                all_procs.append({
+                    "pid":      info["pid"],
+                    "name":     info["name"] or "?",
+                    "ram":      info["memory_info"].rss if info["memory_info"] else 0,
+                    "cpu":      info["cpu_percent"] or 0.0,
+                    "windowed": info["pid"] in windowed_pids,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        # Collect PIDs from top-10 by RAM and top-10 by CPU, plus all windowed.
+        top_ram_pids = {
+            p["pid"]
+            for p in sorted(all_procs, key=lambda x: x["ram"], reverse=True)[:10]
+        }
+        top_cpu_pids = {
+            p["pid"]
+            for p in sorted(all_procs, key=lambda x: x["cpu"], reverse=True)[:10]
+        }
+        interesting = windowed_pids | top_ram_pids | top_cpu_pids
+
+        selected = [p for p in all_procs if p["pid"] in interesting]
+        # Sort: windowed apps first, then by RAM descending within each group.
+        selected.sort(key=lambda x: (not x["windowed"], -x["ram"]))
+
+        if not selected:
+            return {"success": True, "message": "No foreground applications found.", "apps": []}
+
+        lines: list[str] = []
+        for p in selected:
+            tag    = "[W]" if p["windowed"] else "[R]"
+            ram_gb = p["ram"] / 1_073_741_824
+            lines.append(
+                f"{tag} PID: {p['pid']:<6} | {p['name']:<28} | "
+                f"RAM: {ram_gb:.2f} GB | CPU: {p['cpu']:.1f}%"
+            )
+
+        return {
+            "success": True,
+            "message": "\n".join(lines),
+            "apps": [{"pid": p["pid"], "name": p["name"]} for p in selected],
+        }
+
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _handle_kill_app(payload: dict) -> dict:
+    """
+    Forcefully terminate a process by PID or by name.
+
+    payload keys:
+      pid          (int, optional)  — target a single process by PID
+      process_name (str, optional)  — kill all processes with this exact name
+
+    Protection layers:
+      1. Explicit blocklist (_PROTECTED_PROCESSES) — returns a clear rejection.
+      2. PID 0 (Idle) and PID 4 (System) guard — kernel pseudo-processes.
+      3. psutil.AccessDenied — elevated system processes refuse the kill call.
+      4. psutil.NoSuchProcess — process already exited between listing and kill.
+    All errors are caught individually so one failure never crashes the worker.
+    """
+    pid: int | None = payload.get("pid")
+    name: str | None = payload.get("process_name")
+
+    if pid is None and not name:
+        return {"success": False, "error": "Provide 'pid' (int) or 'process_name' (str)."}
+
+    # --- Resolve the target process list ------------------------------------
+    targets: list[psutil.Process] = []
+    try:
+        if pid is not None:
+            targets = [psutil.Process(int(pid))]
+        else:
+            assert name is not None
+            name_lower = name.lower()
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if (proc.info["name"] or "").lower() == name_lower:
+                        targets.append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    except psutil.NoSuchProcess:
+        return {"success": False, "error": f"No process found with PID {pid}."}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+    if not targets:
+        return {"success": False, "error": f"No running process named '{name}'."}
+
+    # --- Kill each target, collecting per-process results -------------------
+    lines: list[str] = []
+    killed = failed = 0
+
+    for proc in targets:
+        proc_pid = proc.pid
+        try:
+            proc_name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            proc_name = "?"
+
+        # Guard: kernel pseudo-processes
+        if proc_pid in (0, 4):
+            lines.append(f"BLOCKED  PID {proc_pid} ({proc_name}): kernel process.")
+            failed += 1
+            continue
+
+        # Guard: explicit name blocklist
+        if proc_name.lower() in _PROTECTED_PROCESSES:
+            lines.append(f"BLOCKED  PID {proc_pid} ({proc_name}): protected system process.")
+            failed += 1
+            continue
+
+        try:
+            proc.kill()  # TerminateProcess on Windows — immediate, no cleanup window
+            lines.append(f"KILLED   PID {proc_pid} ({proc_name})")
+            killed += 1
+        except psutil.NoSuchProcess:
+            lines.append(f"SKIPPED  PID {proc_pid} ({proc_name}): already exited.")
+            failed += 1
+        except psutil.AccessDenied:
+            lines.append(f"DENIED   PID {proc_pid} ({proc_name}): insufficient privileges.")
+            failed += 1
+        except Exception as exc:
+            lines.append(f"ERROR    PID {proc_pid} ({proc_name}): {exc}")
+            failed += 1
+
+    summary = f"Killed: {killed}  |  Blocked/Failed: {failed}"
+    return {
+        "success": killed > 0 and failed == 0,
+        "message": summary + "\n\n" + "\n".join(lines),
+        "killed": killed,
+        "failed": failed,
+    }
+
+
+# --- Media & display control -------------------------------------------------
+
+def _handle_adjust_volume(payload: dict) -> dict:
+    """
+    Set or nudge the system master volume.
+
+    payload keys (mutually exclusive — absolute takes priority):
+      absolute_level (int, 0–100) — set volume to an exact percentage.
+      step           (str)        — relative adjustment, e.g. "+10" or "-20".
+
+    Strategy:
+    - absolute_level  → pycaw IAudioEndpointVolume.SetMasterVolumeLevelScalar()
+      Precise, idempotent, no simulated keypresses.
+    - step            → pycaw read current level, clamp, then SetMasterVolumeLevelScalar().
+      Avoids the VK_VOLUME_UP/DOWN toggle approach, which sends fixed OS-defined
+      increments (~2% per key) and cannot target an exact level.
+    """
+    if platform.system() != "Windows":
+        return {"success": False, "error": "adjust_volume is Windows-only."}
+
+    absolute: int | None = payload.get("absolute_level")
+    step_raw: str | None = payload.get("step")
+
+    if absolute is None and not step_raw:
+        return {"success": False, "error": "Provide 'absolute_level' (0–100) or 'step' (e.g. '+10')."}
+
+    try:
+        from ctypes import cast as ct_cast, POINTER
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        import comtypes
+
+        speakers  = AudioUtilities.GetSpeakers()
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+        vol_ctrl  = ct_cast(interface, POINTER(IAudioEndpointVolume))
+
+        if absolute is not None:
+            target = max(0, min(100, int(absolute)))
+        else:
+            # Parse step string: "+10", "-20", "10", etc.
+            step_str = str(step_raw).strip().replace(" ", "")
+            try:
+                step_val = int(step_str)
+            except ValueError:
+                return {"success": False, "error": f"Cannot parse step value: '{step_raw}'"}
+            current_scalar = vol_ctrl.GetMasterVolumeLevelScalar()
+            current_pct    = round(current_scalar * 100)
+            target         = max(0, min(100, current_pct + step_val))
+
+        vol_ctrl.SetMasterVolumeLevelScalar(target / 100.0, None)
+        # Unmute if we're setting a non-zero level (muted volume stays muted otherwise).
+        if target > 0:
+            vol_ctrl.SetMute(0, None)
+
+        return {"success": True, "message": f"Volume set to {target}%."}
+
+    except ImportError:
+        return {"success": False, "error": "pycaw is not installed. Run: pip install pycaw"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _handle_adjust_brightness(payload: dict) -> dict:
+    """
+    Set or nudge display brightness on all monitors.
+
+    payload keys (mutually exclusive — absolute takes priority):
+      absolute_level (int, 0–100) — set to an exact percentage.
+      step           (str)        — relative adjustment, e.g. "+10" or "-10".
+
+    Uses screen-brightness-control (sbc), which automatically selects the
+    right backend per monitor:
+      - Laptop / integrated panels → WMI (always works on Windows)
+      - External monitors          → DDC/CI via the monitor's I²C bus
+
+    DDC/CI failures (external monitors that don't support software control)
+    are caught per-monitor so one unsupported display never blocks the others.
+    """
+    absolute: int | None = payload.get("absolute_level")
+    step_raw: str | None = payload.get("step")
+
+    if absolute is None and not step_raw:
+        return {"success": False, "error": "Provide 'absolute_level' (0–100) or 'step' (e.g. '+10')."}
+
+    try:
+        import screen_brightness_control as sbc  # type: ignore
+    except ImportError:
+        return {
+            "success": False,
+            "error": "screen-brightness-control is not installed. Run: pip install screen-brightness-control",
+        }
+
+    # Parse step once (used in the per-monitor relative path).
+    step_val: int | None = None
+    if absolute is None:
+        try:
+            step_val = int(str(step_raw).strip().replace(" ", ""))
+        except ValueError:
+            return {"success": False, "error": f"Cannot parse step value: '{step_raw}'"}
+
+    try:
+        monitors = sbc.list_monitors()
+    except Exception as exc:
+        return {"success": False, "error": f"Could not enumerate monitors: {exc}"}
+
+    if not monitors:
+        return {"success": False, "error": "No controllable monitors found."}
+
+    results: list[str] = []
+    any_ok = False
+
+    for mon in monitors:
+        try:
+            if absolute is not None:
+                target = max(0, min(100, int(absolute)))
+            else:
+                assert step_val is not None
+                current_list = sbc.get_brightness(display=mon)
+                current      = current_list[0] if current_list else 50
+                target       = max(0, min(100, current + step_val))
+
+            sbc.set_brightness(target, display=mon)
+            results.append(f"OK       {mon}: brightness → {target}%")
+            any_ok = True
+
+        except sbc.exceptions.ScreenBrightnessError as exc:
+            # DDC/CI not supported on this monitor — surface a friendly message.
+            results.append(f"SKIPPED  {mon}: monitor does not support software brightness control ({exc})")
+        except Exception as exc:
+            results.append(f"ERROR    {mon}: {exc}")
+
+    return {
+        "success": any_ok,
+        "message": "\n".join(results),
+    }
+
+
+# --- Claude Code -------------------------------------------------------------
+
+# Fallback path if `claude` is not on PATH (Windows installation default).
+_CLAUDE_FALLBACK_PATH = r"C:\Users\madus\.local\bin\claude.exe"
+
+# Standard coding tools that cover the full build/edit/read workflow.
+# The worker caller may override this via the `allowed_tools` payload key.
+_CLAUDE_DEFAULT_TOOLS = "Bash,Write,Edit,Read,Glob,Grep,LS,MultiEdit"
+
+
+def _handle_run_claude_code(payload: dict) -> dict:
+    """
+    Invoke the Claude Code CLI in non-interactive (-p) mode.
+
+    payload keys:
+      prompt             (str, required)  — task instructions for Claude Code.
+      working_directory  (str, optional)  — CWD for the subprocess; must be
+                                            within ALLOWED_WORKSPACES. Defaults
+                                            to the first configured workspace.
+      timeout            (int, optional)  — max wall-clock seconds (default 600).
+      allowed_tools      (str, optional)  — comma-separated override for the
+                                            --allowedTools flag.
+
+    Claude Code is run as:
+      claude -p <prompt>
+             --allowedTools <tools>
+             --no-session-persistence
+
+    The last 30 lines of stdout are returned as the Telegram message so the
+    user gets a concise status report without being flooded by full build logs.
+    """
+    prompt: str = payload.get("prompt", "").strip()
+    if not prompt:
+        return {"success": False, "error": "payload.prompt is required."}
+
+    working_directory: str = payload.get("working_directory", "")
+    timeout: int = int(payload.get("timeout", 600))
+    allowed_tools: str = payload.get("allowed_tools", _CLAUDE_DEFAULT_TOOLS)
+
+    # Resolve the working directory — must be within ALLOWED_WORKSPACES.
+    if working_directory:
+        resolved = _require_allowed(working_directory)
+        if resolved is None:
+            return {
+                "success": False,
+                "error": f"working_directory not in ALLOWED_WORKSPACES: {working_directory}",
+            }
+    else:
+        # No directory specified — fall back to the first configured workspace.
+        if not ALLOWED_WORKSPACES:
+            return {"success": False, "error": "No ALLOWED_WORKSPACES configured."}
+        resolved = str(Path(ALLOWED_WORKSPACES[0]).resolve())
+
+    os.makedirs(resolved, exist_ok=True)
+
+    # Locate the claude executable; fall back to the known installation path.
+    claude_exe = shutil.which("claude") or _CLAUDE_FALLBACK_PATH
+    if not Path(claude_exe).exists():
+        return {
+            "success": False,
+            "error": f"Claude Code executable not found at '{claude_exe}'. "
+                     "Ensure it is installed and on PATH.",
+        }
+
+    cmd = [
+        claude_exe,
+        "-p", prompt,
+        "--allowedTools", allowed_tools,
+        "--no-session-persistence",   # keep worker invocations isolated
+    ]
+
+    log.info(
+        "[claude] Starting: cwd=%s tools=%s timeout=%ds prompt=%.120s",
+        resolved, allowed_tools, timeout, prompt,
+    )
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=resolved,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ},  # inherit PATH, ANTHROPIC_API_KEY, etc.
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": f"Claude Code timed out after {timeout}s.",
+            "stdout": "",
+            "stderr": "",
+            "exit_code": -1,
+        }
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "stdout": "", "stderr": "", "exit_code": -1}
+
+    # Trim to last 30 lines for the Telegram message — build logs are verbose.
+    stdout_lines = result.stdout.splitlines()
+    tail = "\n".join(stdout_lines[-30:]) if stdout_lines else "(no output)"
+
+    log.info("[claude] Finished: exit=%d lines=%d", result.returncode, len(stdout_lines))
+
+    return {
+        "success": result.returncode == 0,
+        "message": tail,
+        "stdout": result.stdout[:6000],
+        "stderr": result.stderr[:2000],
+        "exit_code": result.returncode,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streaming Claude Code handler (called directly from dispatch)
+# ---------------------------------------------------------------------------
+
+def _handle_run_claude_code_streaming(task: dict) -> None:
+    """
+    Long-running variant of run_claude_code that uses subprocess.Popen so
+    Claude Code's stdout can be streamed back to the user in real-time without
+    waiting up to 20 minutes for the process to finish.
+
+    Output is buffered for _CLAUDE_STREAM_INTERVAL seconds and then flushed
+    as a Markdown code block to the Next.js /api/worker-callback endpoint
+    (falling back to direct Telegram delivery if ORCHESTRATOR_CALLBACK_URL is
+    not set).
+
+    This function manages its own result routing; dispatch() must return
+    immediately after calling it.
+    """
+    payload:      dict       = task.get("payload", {})
+    sender_id:    str | None = task.get("sender_id")
+    bot_token:    str        = task.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+    task_id:      str        = task.get("task_id", "?")
+    callback_url: str        = payload.get("callback_url", ORCHESTRATOR_CALLBACK_URL)
+
+    if not sender_id:
+        log.warning("[claude-stream] task has no sender_id — cannot stream output.")
+        return
+
+    def _send(text: str) -> None:
+        _post_worker_callback(text, sender_id, task_id, bot_token, callback_url)
+
+    # ------------------------------------------------------------------
+    # 1. Validate prompt
+    # ------------------------------------------------------------------
+    prompt: str = payload.get("prompt", "").strip()
+    if not prompt:
+        _send("❌ run_claude_code: payload.prompt is required.")
+        return
+
+    # ------------------------------------------------------------------
+    # 2. Resolve working directory (must be within ALLOWED_WORKSPACES)
+    # ------------------------------------------------------------------
+    working_directory: str = payload.get("working_directory", "")
+    timeout: int           = int(payload.get("timeout", 1200))  # 20-min default
+    allowed_tools: str     = payload.get("allowed_tools", _CLAUDE_DEFAULT_TOOLS)
+
+    if working_directory:
+        resolved = _require_allowed(working_directory)
+        if resolved is None:
+            _send(f"❌ working_directory not in ALLOWED_WORKSPACES: {working_directory}")
+            return
+    else:
+        if not ALLOWED_WORKSPACES:
+            _send("❌ No ALLOWED_WORKSPACES configured.")
+            return
+        resolved = str(Path(ALLOWED_WORKSPACES[0]).resolve())
+
+    os.makedirs(resolved, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 3. Locate the Claude CLI executable
+    # ------------------------------------------------------------------
+    claude_exe = shutil.which("claude") or _CLAUDE_FALLBACK_PATH
+    if not Path(claude_exe).exists():
+        _send(
+            f"❌ Claude Code executable not found at `{claude_exe}`.\n"
+            "Ensure it is installed and available on PATH."
+        )
+        return
+
+    cmd = [
+        claude_exe,
+        "-p", prompt,
+        "--allowedTools", allowed_tools,
+        "--no-session-persistence",
+    ]
+
+    log.info(
+        "[claude-stream] Starting: cwd=%s tools=%s timeout=%ds prompt=%.120s",
+        resolved, allowed_tools, timeout, prompt,
+    )
+    _send(f"🤖 *Claude Code started* (task `{task_id}`)\n`cwd: {resolved}`")
+
+    # ------------------------------------------------------------------
+    # 4. Launch subprocess with piped stdout
+    # ------------------------------------------------------------------
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=resolved,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr so nothing is silently lost
+            text=True,
+            encoding="utf-8",
+            errors="replace",           # never crash on garbled terminal escapes
+            env={**os.environ},         # inherit PATH, ANTHROPIC_API_KEY, etc.
+        )
+    except Exception as exc:
+        _send(f"❌ Failed to launch Claude Code: {exc}")
+        return
+
+    # ------------------------------------------------------------------
+    # 5. Stream output with 5-second batching
+    # ------------------------------------------------------------------
+    deadline: float = time.time() + timeout
+    # Use a dict so the nested helper can mutate state without nonlocal.
+    # Telegram message limit is 4096 chars; code-block delimiters take ~7.
+    _CHUNK_LIMIT = 3800
+    state = {"buffer": "", "last_flush": time.time()}
+
+    def _flush_buffer() -> None:
+        content = state["buffer"].rstrip()
+        state["buffer"] = ""
+        state["last_flush"] = time.time()
+        if not content:
+            return
+        # Split oversized output across multiple messages.
+        for offset in range(0, max(1, len(content)), _CHUNK_LIMIT):
+            piece = content[offset : offset + _CHUNK_LIMIT]
+            _send(f"```\n{piece}\n```")
+
+    try:
+        while True:
+            # Hard deadline — kill the process rather than block indefinitely.
+            if time.time() > deadline:
+                log.warning("[claude-stream] Timeout (%ds) exceeded — killing process.", timeout)
+                process.kill()
+                _flush_buffer()
+                _send(f"⏱ *Claude Code timed out* after {timeout}s and was terminated.")
+                return
+
+            line: str = process.stdout.readline()  # type: ignore[union-attr]
+
+            # readline() returns '' only at EOF after the process has exited.
+            if line == "" and process.poll() is not None:
+                break
+
+            if line:
+                state["buffer"] += line
+
+            # Flush every _CLAUDE_STREAM_INTERVAL seconds.
+            if state["buffer"] and (time.time() - state["last_flush"]) >= _CLAUDE_STREAM_INTERVAL:
+                _flush_buffer()
+
+    except Exception as exc:
+        log.exception("[claude-stream] Error reading subprocess stdout.")
+        state["buffer"] += f"\n[stream read error: {exc}]"
+
+    # ------------------------------------------------------------------
+    # 6. Final flush and completion notice
+    # ------------------------------------------------------------------
+    _flush_buffer()
+
+    exit_code: int = process.returncode if process.returncode is not None else -1
+    log.info("[claude-stream] Finished: exit=%d", exit_code)
+
+    if exit_code == 0:
+        _send("✅ *Claude Code — Task Complete* (exit 0)")
+    else:
+        _send(f"❌ *Claude Code — Task Failed* (exit {exit_code})")
 
 
 # ---------------------------------------------------------------------------
@@ -1171,11 +1986,21 @@ HANDLERS: dict[str, Any] = {
     "spotify_close": _handle_spotify_close,
     # System
     "open_url": _handle_open_url,
+    "open_app": _handle_open_app,
     "system_status": _handle_system_status,
     "system_lock": _handle_system_lock,
     "system_shutdown": _handle_system_shutdown,
     "system_restart": _handle_system_restart,
     "system_sleep": _handle_system_sleep,
+    "lockdown_pc": _handle_lockdown_pc,
+    # Task manager
+    "list_apps": _handle_list_apps,
+    "kill_app": _handle_kill_app,
+    # Media & display
+    "adjust_volume": _handle_adjust_volume,
+    "adjust_brightness": _handle_adjust_brightness,
+    # Claude Code
+    "run_claude_code": _handle_run_claude_code,
 }
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +2021,12 @@ def dispatch(task: dict, r: redis_lib.Redis) -> None:  # type: ignore[type-arg]
     handler = HANDLERS.get(action)
     if handler is None:
         result: dict = {"error": f"Unknown action: {action}"}
+    elif action == "run_claude_code":
+        # Streaming variant: launches Popen, buffers output, POSTs to the
+        # orchestrator every 5 s, and sends a final status message.
+        # It manages its own result routing, so we return immediately.
+        _handle_run_claude_code_streaming(task)
+        return
     else:
         try:
             result = handler(payload)

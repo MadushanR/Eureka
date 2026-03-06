@@ -37,3 +37,6 @@ xhtml2pdf>=0.2.13,<0.3.0           # HTML to PDF (pure Python)
 # --- Host Worker ---------------------------------------------------------
 redis>=4.6.0,<6.0.0                # Redis client for host_worker.py (raw TCP BLPOP)
 psutil>=5.9.0,<7.0.0               # System metrics for system_status action
+pycaw>=20181226                    # Windows Core Audio WASAPI wrapper (lockdown mute)
+pywin32>=306                       # win32gui/win32process for visible-window enumeration (list_apps)
+screen-brightness-control>=0.23.0  # DDC/CI + WMI brightness for adjust_brightness
