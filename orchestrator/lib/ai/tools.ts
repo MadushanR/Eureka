@@ -1189,7 +1189,7 @@ export const spotifyPrevious = tool({
 });
 
 export const spotifyVolume = tool({
-    description: "Set Spotify volume. Use when the user asks to turn volume up/down or set a specific level.",
+    description: "Set Spotify app volume (not system volume). Only use when the user explicitly says 'Spotify volume'.",
     inputSchema: z.object({
         volume_percent: z.number().min(0).max(100).describe("Volume level from 0 to 100."),
     }),
@@ -1209,6 +1209,25 @@ export const spotifyClose = tool({
         "Close or quit the Spotify desktop app on the user's PC. Use when the user asks to close Spotify, exit Spotify, or stop the Spotify app.",
     inputSchema: z.object({}),
     async execute(): Promise<unknown> { return workerCall("spotify_close"); },
+});
+
+// ---------------------------------------------------------------------------
+// System volume — via worker on user's PC (pycaw/WASAPI)
+// ---------------------------------------------------------------------------
+
+export const systemVolume = tool({
+    description:
+        "Set or adjust the system master volume on the user's PC. " +
+        "Use when the user says 'change volume', 'turn up/down volume', 'set volume to X', 'volume up/down', etc. " +
+        "Prefer this over spotify_volume for all generic volume requests. " +
+        "Pass absolute_level (0–100) to set an exact level, or step (e.g. '+10' or '-20') for relative adjustment.",
+    inputSchema: z.object({
+        absolute_level: z.number().min(0).max(100).optional().describe("Set volume to this exact percentage (0–100)."),
+        step: z.string().optional().describe("Relative adjustment, e.g. '+10' or '-20'."),
+    }),
+    async execute({ absolute_level, step }: { absolute_level?: number; step?: string }): Promise<unknown> {
+        return workerCall("adjust_volume", { absolute_level, step });
+    },
 });
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1281,20 @@ export const openApp = tool({
     }),
     async execute({ app_name }: { app_name: string }): Promise<unknown> {
         return workerCall("open_app", { app_name });
+    },
+});
+
+export const closeApp = tool({
+    description:
+        "Close or kill a running Windows application by process name. " +
+        "Use when the user asks to close, quit, exit, or kill any app — e.g. 'close Chrome', 'kill Spotify', 'quit Notepad'. " +
+        "Pass the executable process name (e.g. 'chrome.exe', 'spotify.exe', 'notepad.exe'). " +
+        "Do NOT use open_app for this — only use close_app when the user wants to close/quit/exit an app.",
+    inputSchema: z.object({
+        process_name: z.string().describe("Exact process executable name, e.g. 'chrome.exe', 'spotify.exe', 'code.exe'."),
+    }),
+    async execute({ process_name }: { process_name: string }): Promise<unknown> {
+        return workerCall("kill_app", { process_name });
     },
 });
 
@@ -1323,12 +1356,14 @@ const baseAiTools = {
     spotify_volume: spotifyVolume,
     spotify_status: spotifyStatus,
     spotify_close: spotifyClose,
+    system_volume: systemVolume,
     system_shutdown: systemShutdown,
     system_restart: systemRestart,
     system_sleep: systemSleep,
     system_lock: systemLock,
     open_url: openUrl,
     open_app: openApp,
+    close_app: closeApp,
 };
 
 /**
