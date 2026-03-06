@@ -1316,6 +1316,34 @@ export const closeApp = tool({
     },
 });
 
+// ---------------------------------------------------------------------------
+// Claude Code — delegate a task to the local Claude Code CLI
+// ---------------------------------------------------------------------------
+
+export const runClaudeCode = tool({
+    description:
+        "Delegate a coding task to the Claude Code CLI running on the user's local machine. " +
+        "Use this for large builds, multi-file refactors, or any task where Claude Code's " +
+        "native file-editing tools (Write, Edit, Bash, Glob, Grep) are better suited than " +
+        "manual patch application. Output is streamed back to Telegram in real time. " +
+        "Use when the user says things like 'use Claude Code to build', 'let Claude Code handle it', " +
+        "'build this with Claude Code', or for any complex project that benefits from an autonomous coding agent.",
+    inputSchema: z.object({
+        prompt: z.string().describe("Full task description / instructions for Claude Code."),
+        working_directory: z.string().optional().describe("Absolute path to the project directory (must be in ALLOWED_WORKSPACES). Defaults to the first configured workspace."),
+        timeout: z.number().optional().describe("Maximum seconds to wait before giving up (default 1200 = 20 min)."),
+        allowed_tools: z.string().optional().describe("Comma-separated list of Claude Code tools to allow. Defaults to 'Bash,Write,Edit,Read,Glob,Grep,LS,MultiEdit'."),
+    }),
+    async execute({ prompt, working_directory, timeout, allowed_tools }: {
+        prompt: string;
+        working_directory?: string;
+        timeout?: number;
+        allowed_tools?: string;
+    }): Promise<unknown> {
+        return workerCall("run_claude_code", { prompt, working_directory, timeout, allowed_tools });
+    },
+});
+
 /**
  * Tool: find_file
  * ---------------
@@ -1383,6 +1411,7 @@ const baseAiTools = {
     open_url: openUrl,
     open_app: openApp,
     close_app: closeApp,
+    run_claude_code: runClaudeCode,
 };
 
 /**
@@ -1427,7 +1456,7 @@ export function makeAiTools(senderId: string) {
                 return await callWorker("capture_webcam", {
                     chat_id: senderId,
                     bot_token: botToken,
-                });
+                }, 90_000); // 90s: camera init + 5-frame warmup + Telegram upload
             } catch (e) {
                 return { error: e instanceof Error ? e.message : "Worker error capturing webcam." };
             }
