@@ -910,7 +910,103 @@ def _spotify_request(method: str, path: str, body: dict | None = None) -> dict:
 
 
 def _handle_spotify_play(_payload: dict) -> dict:
-    return _spotify_request("PUT", "/me/player/play")
+    """Play Spotify with automatic device discovery and retry on 404."""
+    token = _get_spotify_access_token()
+    if not token:
+        return {"success": False, "error": "Spotify not configured or token refresh failed."}
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Attempt 1: plain play
+    try:
+        res = requests.put(
+            "https://api.spotify.com/v1/me/player/play",
+            headers=headers, json={}, timeout=10,
+        )
+        if res.status_code in (200, 204):
+            return {"success": True, "message": "Playing."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    # If not a 404/device error, return immediately
+    if res.status_code != 404:
+        return {"success": False, "error": f"Spotify API {res.status_code}"}
+
+    # 404 → no active device. Get available devices and retry.
+    try:
+        dev_res = requests.get(
+            "https://api.spotify.com/v1/me/player/devices",
+            headers=headers, timeout=10,
+        )
+        if dev_res.status_code == 200:
+            devices = dev_res.json().get("devices", [])
+            if devices:
+                # Pick the best device (prefer Computer type)
+                device_id = None
+                for d in devices:
+                    dtype = (d.get("type") or "").lower()
+                    dname = (d.get("name") or "").lower()
+                    if "computer" in dtype or "pc" in dname or "desktop" in dname:
+                        device_id = d.get("id")
+                        break
+                if not device_id:
+                    device_id = devices[0].get("id")
+                if device_id:
+                    res2 = requests.put(
+                        f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
+                        headers=headers, json={}, timeout=10,
+                    )
+                    if res2.status_code in (200, 204):
+                        return {"success": True, "message": "Playing on your device."}
+                    return {"success": False, "error": f"Spotify API {res2.status_code}"}
+    except Exception:
+        pass
+
+    # No devices found → try launching Spotify desktop, wait, then retry
+    launched = False
+    try:
+        if platform.system() == "Windows":
+            appdata = os.environ.get("APPDATA", "")
+            spotify_exe = Path(appdata) / "Spotify" / "Spotify.exe"
+            if spotify_exe.is_file():
+                subprocess.Popen(
+                    [str(spotify_exe)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                launched = True
+            else:
+                subprocess.run(
+                    ["cmd", "/c", "start", "spotify:"],
+                    timeout=5, capture_output=True, check=False,
+                )
+                launched = True
+    except Exception:
+        pass
+
+    if launched:
+        time.sleep(5)
+        try:
+            dev_res2 = requests.get(
+                "https://api.spotify.com/v1/me/player/devices",
+                headers=headers, timeout=10,
+            )
+            if dev_res2.status_code == 200:
+                devices2 = dev_res2.json().get("devices", [])
+                if devices2:
+                    device_id = devices2[0].get("id")
+                    if device_id:
+                        res3 = requests.put(
+                            f"https://api.spotify.com/v1/me/player/play?device_id={device_id}",
+                            headers=headers, json={}, timeout=10,
+                        )
+                        if res3.status_code in (200, 204):
+                            return {"success": True, "message": "Opened Spotify and started playing."}
+                        return {"success": False, "error": f"Spotify API {res3.status_code}"}
+            return {"success": False, "error": "Opened Spotify but no device appeared yet. Try again in a few seconds."}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    return {"success": False, "error": "No active device found. Open Spotify on your PC or phone, then try again."}
 
 
 def _handle_spotify_pause(_payload: dict) -> dict:

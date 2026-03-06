@@ -93,6 +93,23 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
         return parts.join("\n");
     }
 
+    // find_file: { success, count, files: [ { name, path, size_bytes, modified_ts } ] }
+    if (obj.success === true && Array.isArray(obj.files)) {
+        const files = obj.files as Array<{ name?: string; path?: string; size_bytes?: number }>;
+        if (files.length === 0) {
+            return "No files found matching that search.";
+        }
+        const lines: string[] = [`Found ${files.length} file(s):`];
+        for (const f of files.slice(0, 10)) {
+            const name = f.name ?? "(unnamed)";
+            const path = f.path ?? "?";
+            const sizeMB = f.size_bytes != null ? ` (${(f.size_bytes / 1048576).toFixed(1)} MB)` : "";
+            lines.push(`• ${name}${sizeMB}\n  ${path}`);
+        }
+        if (files.length > 10) lines.push(`… and ${files.length - 10} more.`);
+        return lines.join("\n");
+    }
+
     // delete_path / Spotify: { success, message } or { success: false, error }
     if (typeof obj.success === "boolean" && !Array.isArray(obj.entries)) {
         if (obj.success && typeof obj.message === "string") {
@@ -127,8 +144,8 @@ function formatToolResultForUser(value: unknown, toolName?: string): string {
                     e.type === "folder"
                         ? "folder"
                         : e.type === "file"
-                          ? "file"
-                          : "item";
+                            ? "file"
+                            : "item";
                 lines.push(`• ${name} (${kind})`);
             }
             if (entries.length > 50) {
@@ -245,14 +262,14 @@ export interface ProcessUserMessageOptions {
 /** Injected into system prompts when EUREKA_SELF_PATH is configured. */
 const SELF_AWARENESS_HINT = process.env.EUREKA_SELF_PATH
     ? `\nThis AI assistant is the Eureka project, located at: ${process.env.EUREKA_SELF_PATH}. ` +
-      `When the user asks to add a feature to this bot, to Eureka, to "this project", or to "yourself", ` +
-      `use "${process.env.EUREKA_SELF_PATH}" as the workspace path. ` +
-      `After implementing changes, use prepare_push_approval to commit and push to GitHub.\n\n` +
-      `EUREKA ARCHITECTURE — how to add a new capability:\n` +
-      `1. Add a handler function _handle_X(payload) to rag-daemon/host_worker.py and register it in the HANDLERS dict.\n` +
-      `2. Add a matching tool export to orchestrator/lib/ai/tools.ts using workerCall("X", ...) and add it to baseAiTools.\n` +
-      `That is the complete two-file pattern. Always read both files first to understand existing patterns before editing.\n` +
-      `Key sections: HANDLERS dict near bottom of host_worker.py; baseAiTools object near bottom of tools.ts.`
+    `When the user asks to add a feature to this bot, to Eureka, to "this project", or to "yourself", ` +
+    `use "${process.env.EUREKA_SELF_PATH}" as the workspace path. ` +
+    `After implementing changes, use prepare_push_approval to commit and push to GitHub.\n\n` +
+    `EUREKA ARCHITECTURE — how to add a new capability:\n` +
+    `1. Add a handler function _handle_X(payload) to rag-daemon/host_worker.py and register it in the HANDLERS dict.\n` +
+    `2. Add a matching tool export to orchestrator/lib/ai/tools.ts using workerCall("X", ...) and add it to baseAiTools.\n` +
+    `That is the complete two-file pattern. Always read both files first to understand existing patterns before editing.\n` +
+    `Key sections: HANDLERS dict near bottom of host_worker.py; baseAiTools object near bottom of tools.ts.`
     : "";
 
 const SYSTEM_PROMPT_NORMAL =
@@ -818,8 +835,8 @@ async function processDev(
                 const missing = verdict.startsWith("INCOMPLETE")
                     ? verdict.replace(/^INCOMPLETE:\s*/, "")
                     : verdict.startsWith("FAILED")
-                      ? verdict.replace(/^FAILED:\s*/, "")
-                      : "The task is not complete.";
+                        ? verdict.replace(/^FAILED:\s*/, "")
+                        : "The task is not complete.";
 
                 const alreadyDone = allSuccessfulTools.length > 0
                     ? `\n\nALREADY COMPLETED (do NOT repeat these — they are DONE):\n${allSuccessfulTools.join("\n")}`
@@ -959,7 +976,7 @@ async function executePhase(
     while (attempt < MAX_PHASE_ATTEMPTS) {
         attempt++;
         if (onProgress) {
-            try { await onProgress(`${phaseLabel} Executing (attempt ${attempt}/${MAX_PHASE_ATTEMPTS})...`); } catch {}
+            try { await onProgress(`${phaseLabel} Executing (attempt ${attempt}/${MAX_PHASE_ATTEMPTS})...`); } catch { }
         }
 
         try {
@@ -991,7 +1008,7 @@ async function executePhase(
             if (buttonActions.length > 0) {
                 const autoResult = await autoApplyAll(result.allToolResults);
                 if (autoResult.applied > 0 && onProgress) {
-                    try { await onProgress(`${phaseLabel} Auto-applied ${autoResult.applied} patch(es).`); } catch {}
+                    try { await onProgress(`${phaseLabel} Auto-applied ${autoResult.applied} patch(es).`); } catch { }
                 }
             }
 
@@ -1341,10 +1358,10 @@ export async function processUserMessage(
         const isLargeProject =
             (lowerText.includes("build") || lowerText.includes("create")) &&
             (lowerText.includes("website") || lowerText.includes("web app") ||
-             lowerText.includes("application") || lowerText.includes("full") ||
-             lowerText.includes("e-commerce") || lowerText.includes("shopping") ||
-             lowerText.includes("dashboard") || lowerText.includes("platform") ||
-             lowerText.includes("multi-page") || lowerText.includes("full-stack"));
+                lowerText.includes("application") || lowerText.includes("full") ||
+                lowerText.includes("e-commerce") || lowerText.includes("shopping") ||
+                lowerText.includes("dashboard") || lowerText.includes("platform") ||
+                lowerText.includes("multi-page") || lowerText.includes("full-stack"));
 
         if (isLargeProject) {
             console.info(`[orchestrator] Using multi-phase flow for sender="${senderId}"`);

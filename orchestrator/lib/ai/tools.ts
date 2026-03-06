@@ -44,9 +44,9 @@ async function resolveRepoName(repoName: string): Promise<string | null> {
 async function workerCall(
     action: string,
     payload: Record<string, unknown> = {},
-): Promise<{ success: boolean; message?: string; error?: string; [k: string]: unknown }> {
+): Promise<{ success: boolean; message?: string; error?: string;[k: string]: unknown }> {
     try {
-        const result = (await callWorker(action, payload)) as { success?: boolean; message?: string; error?: string; [k: string]: unknown };
+        const result = (await callWorker(action, payload)) as { success?: boolean; message?: string; error?: string;[k: string]: unknown };
         return { ...result, success: result.success === true };
     } catch (e) {
         return { success: false, error: e instanceof Error ? e.message : "Worker error." };
@@ -223,8 +223,8 @@ export const getUncommittedChanges = tool({
             const diffText = diff.length > maxDiffLenAllRepos ? diff.slice(0, maxDiffLenAllRepos) + "\n\n… (truncated)" : diff;
             sections.push(
                 `**${repo.name}** (${repo.path})\n\n` +
-                    (statusShort ? `Status: ${statusShort}\n\n` : "") +
-                    "```\n" + diffText + "\n```\n",
+                (statusShort ? `Status: ${statusShort}\n\n` : "") +
+                "```\n" + diffText + "\n```\n",
             );
         }
         return { text: "Summary for all git repos:\n\n" + sections.join("\n---\n\n") };
@@ -246,7 +246,7 @@ export const listFolderContents = tool({
             .min(1, "folder_path must not be empty.")
             .describe(
                 "Absolute path to a folder within one of the allowed workspaces. " +
-                    'For example: "C:\\\\Users\\\\madus\\\\Desktop\\\\Capestone".',
+                'For example: "C:\\\\Users\\\\madus\\\\Desktop\\\\Capestone".',
             ),
     }),
     async execute({ folder_path }: { folder_path: string }): Promise<unknown> {
@@ -1578,8 +1578,13 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    // Remove find_file from the sender-aware tool set so the LLM uses
+    // send_file (which chains find + send) instead of stopping after find_file.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { find_file: _findFileOmitted, ...senderBaseTools } = baseAiTools;
+
     return {
-        ...baseAiTools,
+        ...senderBaseTools,
         send_file: sendFile,
         send_file_to_telegram: sendFileToTelegram,
         capture_webcam: captureWebcam,
