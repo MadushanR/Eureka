@@ -809,8 +809,8 @@ def _spotify_api(
     access_token: str,
     json_body: Optional[Dict[str, Any]] = None,
     params: Optional[Dict[str, Any]] = None,
-) -> tuple[bool, str]:
-    """Call Spotify Web API. Returns (success, message)."""
+) -> tuple[bool, str, int]:
+    """Call Spotify Web API. Returns (success, message, http_status_code)."""
     url = f"https://api.spotify.com/v1{path}"
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
@@ -821,17 +821,17 @@ def _spotify_api(
         elif method == "POST":
             r = requests.post(url, headers=headers, json=json_body, timeout=10)
         else:
-            return False, "Unsupported method"
+            return False, "Unsupported method", 0
         if r.status_code in (200, 204):
-            return True, "OK"
+            return True, "OK", r.status_code
         try:
             err = r.json().get("error", {})
             msg = err.get("message", r.text or str(r.status_code))
         except Exception:
             msg = r.text or str(r.status_code)
-        return False, msg
+        return False, msg, r.status_code
     except Exception as e:
-        return False, str(e)
+        return False, str(e), 0
 
 
 def _spotify_devices_sync(access_token: str) -> tuple[bool, str, List[Dict[str, Any]]]:
@@ -959,16 +959,22 @@ def _spotify_play_sync() -> tuple[bool, str]:
     token = _spotify_access_token()
     if not token:
         return False, "Spotify is not configured (missing client id, secret, or refresh token)."
-    ok, msg = _spotify_api("PUT", "/me/player/play", access_token=token)
+    ok, msg, status = _spotify_api("PUT", "/me/player/play", access_token=token)
     if ok:
         return True, msg
-    # If no active device, get devices and retry with a chosen device
-    if "no active device" in msg.lower() or "device not found" in msg.lower():
+    # If no active device (404) or known error messages, get devices and retry
+    _is_device_error = (
+        status == 404
+        or "no active device" in msg.lower()
+        or "device not found" in msg.lower()
+        or "not found" in msg.lower()
+    )
+    if _is_device_error:
         dev_ok, _, devices = _spotify_devices_sync(token)
         if dev_ok and devices:
             device_id = _pick_best_device(devices)
             if device_id:
-                ok2, msg2 = _spotify_api(
+                ok2, msg2, _ = _spotify_api(
                     "PUT",
                     "/me/player/play",
                     access_token=token,
@@ -985,7 +991,7 @@ def _spotify_play_sync() -> tuple[bool, str]:
             if dev_ok2 and devices2:
                 device_id = _pick_best_device(devices2)
                 if device_id:
-                    ok3, msg3 = _spotify_api(
+                    ok3, msg3, _ = _spotify_api(
                         "PUT",
                         "/me/player/play",
                         access_token=token,
@@ -1003,33 +1009,37 @@ def _spotify_pause_sync() -> tuple[bool, str]:
     token = _spotify_access_token()
     if not token:
         return False, "Spotify is not configured."
-    return _spotify_api("PUT", "/me/player/pause", access_token=token)
+    ok, msg, _ = _spotify_api("PUT", "/me/player/pause", access_token=token)
+    return ok, msg
 
 
 def _spotify_next_sync() -> tuple[bool, str]:
     token = _spotify_access_token()
     if not token:
         return False, "Spotify is not configured."
-    return _spotify_api("POST", "/me/player/next", access_token=token)
+    ok, msg, _ = _spotify_api("POST", "/me/player/next", access_token=token)
+    return ok, msg
 
 
 def _spotify_previous_sync() -> tuple[bool, str]:
     token = _spotify_access_token()
     if not token:
         return False, "Spotify is not configured."
-    return _spotify_api("POST", "/me/player/previous", access_token=token)
+    ok, msg, _ = _spotify_api("POST", "/me/player/previous", access_token=token)
+    return ok, msg
 
 
 def _spotify_volume_sync(volume_percent: int) -> tuple[bool, str]:
     token = _spotify_access_token()
     if not token:
         return False, "Spotify is not configured."
-    return _spotify_api(
+    ok, msg, _ = _spotify_api(
         "PUT",
         "/me/player/volume",
         access_token=token,
         params={"volume_percent": volume_percent},
     )
+    return ok, msg
 
 
 def _spotify_status_sync() -> tuple[bool, str, Optional[Dict[str, Any]]]:

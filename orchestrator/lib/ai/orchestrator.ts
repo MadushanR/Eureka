@@ -260,7 +260,7 @@ const SYSTEM_PROMPT_NORMAL =
     "You can open apps (open_app), take webcam photos (capture_webcam), control Spotify, manage files, run git operations, and more. " +
     "Always use tools to fulfil requests — NEVER tell the user to do something themselves when you have a tool that can do it. " +
     "First infer the user's intent, then use the best tool(s) in sequence to fulfil it — chain multiple tools when needed. " +
-    "When the user asks you to send or share a file: first call find_file to locate it, then call send_file_to_telegram with the returned path. Do not stop after find_file. " +
+    "When the user asks you to send or share a file: ALWAYS call find_file first, then IMMEDIATELY call send_file_to_telegram with the path from the result. These are two mandatory sequential steps — find_file alone is never sufficient. " +
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
     "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, remove_lines_matching, or delete_code) so they can resolve the path themselves. " +
     "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
@@ -421,6 +421,17 @@ async function runGenerate(
         messages,
         tools,
         maxSteps,
+        onStepFinish({ toolCalls, toolResults }) {
+            for (const tc of toolCalls ?? []) {
+                console.log(`[tools] call: ${tc.toolName}`, JSON.stringify((tc as unknown as { input?: unknown }).input ?? {}).slice(0, 200));
+            }
+            for (const tr of toolResults ?? []) {
+                const r = (tr as { result?: unknown; output?: unknown; toolName?: string }).result ?? (tr as { output?: unknown }).output;
+                const ok = r && typeof r === "object" && "success" in r ? (r as { success: unknown }).success : "?";
+                const err = r && typeof r === "object" && "error" in r ? (r as { error: unknown }).error : undefined;
+                console.log(`[tools] result: ${(tr as { toolName?: string }).toolName ?? "?"} success=${ok}${err ? ` error=${err}` : ""}`);
+            }
+        },
         ...withTelemetry("orchestrator.runGenerate"),
     } as Parameters<typeof generateText>[0]);
 

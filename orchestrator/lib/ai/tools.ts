@@ -1370,7 +1370,10 @@ export const findFile = tool({
         "Search for files on the local PC by name or recency. " +
         "Use name_pattern to match filenames (substring). " +
         "Use modified_within_days to find recent files (e.g. 1 for yesterday's files). " +
-        "Use folder_path to narrow the search to a specific directory.",
+        "Use folder_path to narrow the search to a specific directory. " +
+        "IMPORTANT: This tool only FINDS the file. If the user wants to send/share the file, " +
+        "you MUST immediately follow up by calling send_file_to_telegram with the returned path. " +
+        "Never stop after find_file when the user's intent is to receive the file.",
     inputSchema: z.object({
         name_pattern: z.string().optional().describe("Filename substring to match (case-insensitive). Leave empty to match all files."),
         folder_path: z.string().optional().describe("Absolute path of folder to search in. Leave empty to search all allowed workspaces."),
@@ -1454,9 +1457,10 @@ export function makeAiTools(senderId: string) {
                     chat_id: senderId,
                     bot_token: botToken,
                     caption: caption ?? "",
-                });
+                }, 90_000); // 90s: covers large files + slow upload to Telegram
             } catch (e) {
-                return { error: e instanceof Error ? e.message : "Worker error sending file." };
+                const msg = e instanceof Error ? e.message : "Worker error sending file.";
+                return { success: false, error: `Failed to send file: ${msg}` };
             }
         },
     });

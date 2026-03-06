@@ -1887,16 +1887,24 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
     bot_token: str = payload.get("bot_token", "")
     caption: str = payload.get("caption", "")
 
+    log.info("[send_file] file_path=%s chat_id=%s", file_path, chat_id)
+
     if not file_path or not chat_id or not bot_token:
+        log.error("[send_file] missing required fields: file_path=%r chat_id=%r bot_token_set=%s", file_path, chat_id, bool(bot_token))
         return {"success": False, "error": "file_path, chat_id, and bot_token are required"}
 
     resolved = _require_allowed(file_path)
     if resolved is None:
+        log.error("[send_file] path not in ALLOWED_WORKSPACES: %s", file_path)
         return {"success": False, "error": f"Path not in ALLOWED_WORKSPACES: {file_path}"}
 
     path = Path(resolved)
     if not path.is_file():
+        log.error("[send_file] file not found: %s", resolved)
         return {"success": False, "error": f"File not found: {resolved}"}
+
+    size_mb = path.stat().st_size / 1_048_576
+    log.info("[send_file] resolved=%s size=%.2f MB", resolved, size_mb)
 
     image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
     is_image = path.suffix.lower() in image_exts
@@ -1904,17 +1912,21 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
     field = "photo" if is_image else "document"
     url = f"https://api.telegram.org/bot{bot_token}/{method}"
 
+    log.info("[send_file] POSTing to Telegram method=%s", method)
     try:
         with open(resolved, "rb") as fh:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption
-            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=60)
+            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(10, 75))
         result = resp.json()
         if result.get("ok"):
+            log.info("[send_file] success: %s", path.name)
             return {"success": True, "message": f"Sent: {path.name}"}
+        log.error("[send_file] Telegram API error: %s", result)
         return {"success": False, "error": result.get("description", "Telegram API error")}
     except Exception as exc:
+        log.error("[send_file] exception: %s", exc)
         return {"success": False, "error": str(exc)}
 
 
@@ -1968,7 +1980,7 @@ def _handle_capture_webcam(payload: dict) -> dict:
                 url,
                 files={"photo": ("sentinel.jpg", fh)},
                 data={"chat_id": chat_id},
-                timeout=30,
+                timeout=(10, 60),  # 10s connect, 60s upload
             )
         result = resp.json()
         if not result.get("ok"):
