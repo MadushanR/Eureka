@@ -1840,6 +1840,7 @@ def _handle_run_claude_code_streaming(task: dict) -> None:
     payload:      dict       = task.get("payload", {})
     sender_id:    str | None = task.get("sender_id")
     bot_token:    str        = task.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+    task_id:      str        = task.get("task_id", "?")
     if not sender_id:
         log.warning("[claude-stream] task has no sender_id — cannot stream output.")
         return

@@ -41,7 +41,7 @@ export const BuildStepSchema = z.object({
     dependsOnStep: z.number().nullable().describe(
         "0-based index of a prior step this one depends on. Use null if this step has no dependency.",
     ),
-    optional: z.boolean().default(false).describe(
+    optional: z.boolean().describe(
         "If true, failure of this step is non-fatal — the build continues. " +
         "Mark test/build-verification and lint steps as optional: true. " +
         "All scaffolding, database, auth, and core API steps must be optional: false.",
