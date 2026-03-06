@@ -1030,8 +1030,16 @@ if ($shortcut) {{
         Start-Process -FilePath '{name}' -ErrorAction Stop
         Write-Output "Launched via App Paths: {name}"
     }} catch {{
-        Write-Error "App not found: {name}"
-        exit 1
+        # App Paths failed — try Get-StartApps which covers UWP/Store apps
+        # (WhatsApp, Teams, etc. that have no .lnk or App Paths entry).
+        $storeApp = Get-StartApps | Where-Object {{ $_.Name -like "*$name*" }} | Select-Object -First 1
+        if ($storeApp) {{
+            Start-Process "shell:AppsFolder\$($storeApp.AppID)"
+            Write-Output "Launched via Store: $($storeApp.Name)"
+        }} else {{
+            Write-Error "App not found: {name}"
+            exit 1
+        }}
     }}
 }}
 """
