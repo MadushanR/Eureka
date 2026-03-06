@@ -2330,10 +2330,14 @@ def dispatch(task: dict, r: redis_lib.Redis) -> None:  # type: ignore[type-arg]
     if handler is None:
         result: dict = {"error": f"Unknown action: {action}"}
     elif action == "run_claude_code":
-        # Streaming variant: launches Popen, buffers output, POSTs to the
-        # orchestrator every 5 s, and sends a final status message.
-        # It manages its own result routing, so we return immediately.
-        _handle_run_claude_code_streaming(task)
+        # Streaming variant: runs in a daemon thread so the main loop can
+        # continue processing other tasks while Claude Code runs.
+        threading.Thread(
+            target=_handle_run_claude_code_streaming,
+            args=(task,),
+            daemon=True,
+            name=f"claude-stream-{task_id}",
+        ).start()
         return
     else:
         try:
