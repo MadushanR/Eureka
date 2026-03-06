@@ -2014,7 +2014,7 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption
-            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(30, 120))
+            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(120, 120))
         result = resp.json()
         if result.get("ok"):
             log.info("[send_file] success: %s", path.name)
@@ -2053,6 +2053,7 @@ def _handle_capture_webcam(payload: dict) -> dict:
 
     tmp_path = Path(__file__).parent / "sentinel_capture.jpg"
 
+    log.info("[webcam] Opening camera...")
     cap = cv2.VideoCapture(0)
     try:
         # Discard the first few frames — cameras need a moment to auto-expose.
@@ -2063,11 +2064,16 @@ def _handle_capture_webcam(payload: dict) -> dict:
         cap.release()  # always free the hardware lock so the green LED turns off
 
     if not ok or frame is None:
+        log.error("[webcam] Capture failed — no frame returned.")
         return {"success": False, "error": "Webcam capture failed — no frame returned."}
 
     written = cv2.imwrite(str(tmp_path), frame)
     if not written or not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        log.error("[webcam] Could not write image file.")
         return {"success": False, "error": "Webcam capture failed — could not write image file."}
+
+    size_kb = tmp_path.stat().st_size / 1024
+    log.info("[webcam] Frame captured: %s (%.1f KB). Uploading to Telegram...", tmp_path, size_kb)
 
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
@@ -2076,13 +2082,16 @@ def _handle_capture_webcam(payload: dict) -> dict:
                 url,
                 files={"photo": ("sentinel.jpg", fh)},
                 data={"chat_id": chat_id},
-                timeout=(10, 60),  # 10s connect, 60s upload
+                timeout=(120, 120),
             )
         result = resp.json()
         if not result.get("ok"):
+            log.error("[webcam] Telegram API error: %s", result)
             return {"success": False, "error": result.get("description", "Telegram API error")}
+        log.info("[webcam] Photo sent successfully to chat_id=%s", chat_id)
         return {"success": True, "message": "Webcam snapshot sent."}
     except Exception as exc:
+        log.error("[webcam] Upload exception: %s", exc)
         return {"success": False, "error": str(exc)}
     finally:
         if tmp_path.exists():
@@ -2133,7 +2142,7 @@ def _handle_rescue_file(payload: dict) -> dict:
                 tg_url,
                 files={"document": (target.name, fh)},
                 data={"chat_id": chat_id, "caption": str(target)},
-                timeout=60,
+                timeout=120,
             )
         result = resp.json()
         if not result.get("ok"):
