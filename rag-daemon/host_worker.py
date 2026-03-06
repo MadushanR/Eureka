@@ -129,6 +129,56 @@ def _tg(chat_id: str, text: str, bot_token: str | None = None) -> None:
             else:
                 log.warning("Telegram send failed: %s", e)
 
+
+def _tg_upload(
+    bot_token: str,
+    chat_id: str,
+    file_path: str,
+    method: str = "sendDocument",
+    field: str = "document",
+    file_name: str | None = None,
+    caption: str = "",
+    max_retries: int = 3,
+) -> dict:
+    """Upload a file to Telegram with retry + exponential backoff.
+
+    Returns {"success": True/False, "message"/"error": ...}.
+    Handles ConnectionResetError, timeouts, and transient network failures.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    fname = file_name or Path(file_path).name
+
+    for attempt in range(max_retries):
+        try:
+            with open(file_path, "rb") as fh:
+                data: dict[str, str] = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption
+                resp = requests.post(
+                    url,
+                    files={field: (fname, fh)},
+                    data=data,
+                    timeout=(120, 120),
+                )
+            result = resp.json()
+            if result.get("ok"):
+                return {"success": True, "message": f"Sent: {fname}"}
+            log.error("[tg_upload] Telegram API error (attempt %d): %s", attempt + 1, result)
+            return {"success": False, "error": result.get("description", "Telegram API error")}
+        except (ConnectionResetError, requests.exceptions.ConnectionError) as exc:
+            log.warning("[tg_upload] Connection error (attempt %d/%d): %s", attempt + 1, max_retries, exc)
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))  # 3s, 6s, 9s
+            else:
+                return {"success": False, "error": f"Connection failed after {max_retries} attempts: {exc}"}
+        except Exception as exc:
+            log.error("[tg_upload] Unexpected error (attempt %d): %s", attempt + 1, exc)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return {"success": False, "error": str(exc)}
+    return {"success": False, "error": "Upload failed after all retries."}
+
 # ---------------------------------------------------------------------------
 # Streaming callback helper
 # ---------------------------------------------------------------------------
@@ -2006,24 +2056,16 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
     is_image = path.suffix.lower() in image_exts
     method = "sendPhoto" if is_image else "sendDocument"
     field = "photo" if is_image else "document"
-    url = f"https://api.telegram.org/bot{bot_token}/{method}"
 
     log.info("[send_file] POSTing to Telegram method=%s", method)
-    try:
-        with open(resolved, "rb") as fh:
-            data = {"chat_id": chat_id}
-            if caption:
-                data["caption"] = caption
-            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(120, 120))
-        result = resp.json()
-        if result.get("ok"):
-            log.info("[send_file] success: %s", path.name)
-            return {"success": True, "message": f"Sent: {path.name}"}
-        log.error("[send_file] Telegram API error: %s", result)
-        return {"success": False, "error": result.get("description", "Telegram API error")}
-    except Exception as exc:
-        log.error("[send_file] exception: %s", exc)
-        return {"success": False, "error": str(exc)}
+    return _tg_upload(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        file_path=str(resolved),
+        method=method,
+        field=field,
+        caption=caption,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2076,23 +2118,14 @@ def _handle_capture_webcam(payload: dict) -> dict:
     log.info("[webcam] Frame captured: %s (%.1f KB). Uploading to Telegram...", tmp_path, size_kb)
 
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        with open(tmp_path, "rb") as fh:
-            resp = requests.post(
-                url,
-                files={"photo": ("sentinel.jpg", fh)},
-                data={"chat_id": chat_id},
-                timeout=(120, 120),
-            )
-        result = resp.json()
-        if not result.get("ok"):
-            log.error("[webcam] Telegram API error: %s", result)
-            return {"success": False, "error": result.get("description", "Telegram API error")}
-        log.info("[webcam] Photo sent successfully to chat_id=%s", chat_id)
-        return {"success": True, "message": "Webcam snapshot sent."}
-    except Exception as exc:
-        log.error("[webcam] Upload exception: %s", exc)
-        return {"success": False, "error": str(exc)}
+        return _tg_upload(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            file_path=str(tmp_path),
+            method="sendPhoto",
+            field="photo",
+            file_name="sentinel.jpg",
+        )
     finally:
         if tmp_path.exists():
             os.remove(tmp_path)
@@ -2135,21 +2168,14 @@ def _handle_rescue_file(payload: dict) -> dict:
             "error": f"File too large ({size / 1024 / 1024:.1f} MB). Telegram's limit is 50 MB.",
         }
 
-    tg_url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    try:
-        with open(target, "rb") as fh:
-            resp = requests.post(
-                tg_url,
-                files={"document": (target.name, fh)},
-                data={"chat_id": chat_id, "caption": str(target)},
-                timeout=120,
-            )
-        result = resp.json()
-        if not result.get("ok"):
-            return {"success": False, "error": result.get("description", "Telegram API error")}
-        return {"success": True, "message": f"Sent: {target}"}
-    except Exception as exc:
-        return {"success": False, "error": str(exc)}
+    return _tg_upload(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        file_path=str(target),
+        method="sendDocument",
+        field="document",
+        caption=str(target),
+    )
 
 
 # ---------------------------------------------------------------------------
