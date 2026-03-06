@@ -1166,7 +1166,8 @@ def _handle_lockdown_pc(_payload: dict) -> dict:
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
         import comtypes
         speakers = AudioUtilities.GetSpeakers()
-        interface = speakers.Activate(
+        mmdevice = getattr(speakers, "_dev", speakers)
+        interface = mmdevice.Activate(
             IAudioEndpointVolume._iid_,
             comtypes.CLSCTX_ALL,
             None,
@@ -1449,7 +1450,9 @@ def _handle_adjust_volume(payload: dict) -> dict:
         import comtypes
 
         speakers  = AudioUtilities.GetSpeakers()
-        interface = speakers.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+        # pycaw >= 0.5 wraps IMMDevice in AudioDevice; the Activate method is on the raw COM device.
+        mmdevice  = getattr(speakers, "_dev", speakers)
+        interface = mmdevice.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
         vol_ctrl  = ct_cast(interface, POINTER(IAudioEndpointVolume))
 
         if absolute is not None:

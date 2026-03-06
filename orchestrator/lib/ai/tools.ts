@@ -1231,6 +1231,24 @@ export const systemVolume = tool({
 });
 
 // ---------------------------------------------------------------------------
+// System brightness — via worker on user's PC (screen-brightness-control)
+// ---------------------------------------------------------------------------
+
+export const systemBrightness = tool({
+    description:
+        "Set or adjust the display brightness on the user's PC. " +
+        "Use when the user says 'change brightness', 'turn up/down brightness', 'set brightness to X', 'brightness up/down', 'dim/brighten screen', etc. " +
+        "Pass absolute_level (0–100) to set an exact level, or step (e.g. '+10' or '-20') for relative adjustment.",
+    inputSchema: z.object({
+        absolute_level: z.number().min(0).max(100).optional().describe("Set brightness to this exact percentage (0–100)."),
+        step: z.string().optional().describe("Relative adjustment, e.g. '+10' or '-20'."),
+    }),
+    async execute({ absolute_level, step }: { absolute_level?: number; step?: string }): Promise<unknown> {
+        return workerCall("adjust_brightness", { absolute_level, step });
+    },
+});
+
+// ---------------------------------------------------------------------------
 // System control (shutdown, sleep, restart, lock) — via worker on user's PC
 // ---------------------------------------------------------------------------
 
@@ -1357,6 +1375,7 @@ const baseAiTools = {
     spotify_status: spotifyStatus,
     spotify_close: spotifyClose,
     system_volume: systemVolume,
+    system_brightness: systemBrightness,
     system_shutdown: systemShutdown,
     system_restart: systemRestart,
     system_sleep: systemSleep,

@@ -662,8 +662,9 @@ export async function pollResult(
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;
         await new Promise((r) => setTimeout(r, Math.min(delay, remaining)));
-        // Exponential backoff capped at 30 s (suitable for both fast tools and long build steps)
-        delay = Math.min(delay * 2, 30_000);
+        // Exponential backoff capped at 3 s — prevents missing results that arrive late
+        // (a 30 s cap caused polls to jump from t=18.9 s to t=30 s, skipping the final window)
+        delay = Math.min(delay * 2, 3_000);
     }
 
     throw new Error(
