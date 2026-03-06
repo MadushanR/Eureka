@@ -1317,6 +1317,22 @@ export const closeApp = tool({
 });
 
 // ---------------------------------------------------------------------------
+// List running processes / apps
+// ---------------------------------------------------------------------------
+
+export const listRunningApps = tool({
+    description:
+        "List the processes currently running on the user's PC. " +
+        "Returns windowed (visible) apps tagged [W] and top resource hogs tagged [R], " +
+        "with their PID, RAM, and CPU usage. Use when the user asks what's running, " +
+        "what apps are open, or wants to find a process before killing it.",
+    inputSchema: z.object({}),
+    async execute(): Promise<unknown> {
+        return workerCall("list_apps", {});
+    },
+});
+
+// ---------------------------------------------------------------------------
 // Claude Code — delegate a task to the local Claude Code CLI
 // ---------------------------------------------------------------------------
 
@@ -1411,6 +1427,7 @@ const baseAiTools = {
     open_url: openUrl,
     open_app: openApp,
     close_app: closeApp,
+    list_running_apps: listRunningApps,
     run_claude_code: runClaudeCode,
 };
 
