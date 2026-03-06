@@ -37,13 +37,17 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import cv2
 import psutil
 import redis as redis_lib
 import requests
+import yt_dlp
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -1937,6 +1941,178 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Remote Sentinel — constants
+# ---------------------------------------------------------------------------
+
+MAX_TG_BYTES = 49 * 1024 * 1024  # 49 MB hard limit (Telegram cap is 50 MB)
+
+MEDIA_DOMAINS = {
+    "youtube.com", "youtu.be", "twitter.com", "x.com",
+    "vimeo.com", "twitch.tv", "tiktok.com", "instagram.com",
+}
+DOWNLOAD_DIR = Path(r"D:\Downloads\Eureka_Media")
+
+
+# ---------------------------------------------------------------------------
+# capture_webcam
+# ---------------------------------------------------------------------------
+
+def _handle_capture_webcam(payload: dict) -> dict:
+    """Snap a single frame from the default webcam and send it to Telegram."""
+    chat_id = str(payload.get("chat_id", ""))
+    bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+
+    if not chat_id or not bot_token:
+        return {"success": False, "error": "chat_id and bot_token are required."}
+
+    tmp_path = Path(__file__).parent / "sentinel_capture.jpg"
+
+    cap = cv2.VideoCapture(0)
+    try:
+        ok, frame = cap.read()
+    finally:
+        cap.release()  # always free the hardware lock so the green LED turns off
+
+    if not ok or frame is None:
+        return {"success": False, "error": "Webcam capture failed — no frame returned."}
+
+    cv2.imwrite(str(tmp_path), frame)
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+        with open(tmp_path, "rb") as fh:
+            resp = requests.post(
+                url,
+                files={"photo": ("sentinel.jpg", fh)},
+                data={"chat_id": chat_id},
+                timeout=30,
+            )
+        result = resp.json()
+        if not result.get("ok"):
+            return {"success": False, "error": result.get("description", "Telegram API error")}
+        return {"success": True, "message": "Webcam snapshot sent."}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+    finally:
+        if tmp_path.exists():
+            os.remove(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# rescue_file
+# ---------------------------------------------------------------------------
+
+def _handle_rescue_file(payload: dict) -> dict:
+    """Find a file by name under %USERPROFILE% and upload it to Telegram."""
+    file_name = payload.get("file_name", "").strip()
+    chat_id = str(payload.get("chat_id", ""))
+    bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+
+    if not file_name or not chat_id:
+        return {"success": False, "error": "file_name and chat_id are required."}
+
+    userprofile = Path(os.environ.get("USERPROFILE", str(Path.home())))
+    matches = list(userprofile.rglob(file_name))
+
+    if not matches:
+        return {"success": False, "error": f"No file named '{file_name}' found under {userprofile}."}
+
+    # Multiple matches → pick most recently modified; notify user of all candidates
+    if len(matches) > 1:
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        paths_list = "\n".join(str(p) for p in matches[:10])
+        _tg(
+            chat_id,
+            f"Found {len(matches)} matches. Sending the most recent one:\n{matches[0]}\n\nAll candidates:\n{paths_list}",
+            bot_token,
+        )
+
+    target = matches[0]
+    size = os.path.getsize(target)
+    if size > MAX_TG_BYTES:
+        return {
+            "success": False,
+            "error": f"File too large ({size / 1024 / 1024:.1f} MB). Telegram's limit is 50 MB.",
+        }
+
+    tg_url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    try:
+        with open(target, "rb") as fh:
+            resp = requests.post(
+                tg_url,
+                files={"document": (target.name, fh)},
+                data={"chat_id": chat_id, "caption": str(target)},
+                timeout=60,
+            )
+        result = resp.json()
+        if not result.get("ok"):
+            return {"success": False, "error": result.get("description", "Telegram API error")}
+        return {"success": True, "message": f"Sent: {target}"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# remote_download (background thread — does not block the BLPOP loop)
+# ---------------------------------------------------------------------------
+
+def _download_worker(url: str, chat_id: str, bot_token: str) -> None:
+    """Background thread: route URL to yt-dlp, requests-stream, or aria2c."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if url.startswith("magnet:"):
+            subprocess.run(
+                ["aria2c", "--dir", str(DOWNLOAD_DIR), url],
+                check=True,
+                timeout=3600,
+            )
+            _tg(chat_id, f"Download complete (aria2c): {url[:80]}", bot_token)
+            return
+
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        if any(d in host for d in MEDIA_DOMAINS):
+            ydl_opts = {
+                "format": "bestvideo+bestaudio/best",
+                "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+                "quiet": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get("title", url) if info else url
+            _tg(chat_id, f"Download complete: {title}", bot_token)
+            return
+
+        # Standard file URL — streaming chunk download
+        fname = Path(url.split("?")[0]).name or "download"
+        dest = DOWNLOAD_DIR / fname
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+        _tg(chat_id, f"Download complete: {dest}", bot_token)
+
+    except Exception as exc:
+        _tg(chat_id, f"Download failed: {exc}", bot_token)
+
+
+def _handle_remote_download(payload: dict) -> dict:
+    """Kick off a background download and return immediately."""
+    url = payload.get("url", "").strip()
+    chat_id = str(payload.get("chat_id", ""))
+    bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+
+    if not url or not chat_id:
+        return {"success": False, "error": "url and chat_id are required."}
+
+    threading.Thread(
+        target=_download_worker,
+        args=(url, chat_id, bot_token),
+        daemon=True,
+    ).start()
+    return {"success": True, "message": f"Download started: {url[:80]}"}
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -2001,6 +2177,10 @@ HANDLERS: dict[str, Any] = {
     "adjust_brightness": _handle_adjust_brightness,
     # Claude Code
     "run_claude_code": _handle_run_claude_code,
+    # Remote Sentinel
+    "capture_webcam": _handle_capture_webcam,
+    "rescue_file": _handle_rescue_file,
+    "remote_download": _handle_remote_download,
 }
 
 # ---------------------------------------------------------------------------
