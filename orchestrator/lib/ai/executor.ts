@@ -49,7 +49,7 @@ interface GitHubCreateRepoResult {
 // ---------------------------------------------------------------------------
 
 const workspacePath = (): string =>
-    process.env.LOCAL_DAEMON_WORKSPACE_PATH?.replace(/\/+$/, "") ?? "C:/Users/madus/Desktop";
+    process.env.LOCAL_DAEMON_WORKSPACE_PATH?.replace(/\/+$/, "") ?? "";
 
 /** Timeout for execute_build_step. Worker allows 600 s per command; accommodate multiple long commands. */
 const BUILD_STEP_TIMEOUT_MS = (() => {

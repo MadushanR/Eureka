@@ -88,11 +88,6 @@ const patchKey = (patchId: string): string => `patch:${patchId}`;
 const pushKey = (pushId: string): string => `push:${pushId}`;
 
 /**
- * Build the Redis key used to temporarily store a pending commit request.
- */
-const commitKey = (commitId: string): string => `commit:${commitId}`;
-
-/**
  * Build the Redis key used to temporarily store a pending push-only request.
  */
 const pushOnlyKey = (pushOnlyId: string): string => `pushonly:${pushOnlyId}`;
@@ -479,6 +474,10 @@ export async function getJob(jobId: string): Promise<DevJob | null> {
     }
 }
 
+// Note: updateJob is not atomic (read-modify-write). Upstash REST does not
+// support WATCH/multi/exec, so a concurrent write between getJob and set could
+// be lost. Acceptable for this single-user bot where concurrent job updates
+// from two callers are extremely unlikely.
 export async function updateJob(jobId: string, updates: Partial<DevJob>): Promise<void> {
     try {
         const existing = await getJob(jobId);

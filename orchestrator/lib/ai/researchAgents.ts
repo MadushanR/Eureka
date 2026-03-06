@@ -27,7 +27,7 @@ const researchModelNames = getResearchModelNames();
 
 /** Get the model for a given research agent. Index: 0=Researcher, 1=Writer, 2=Reviewer, 3=Summariser. */
 function getResearchModel(agentIndex: 0 | 1 | 2 | 3): ReturnType<typeof openai> {
-    const name = researchModelNames[agentIndex] ?? researchModelNames[1] ?? researchModelNames[0] ?? DEFAULT_MODEL;
+    const name = researchModelNames[agentIndex] ?? researchModelNames[0] ?? DEFAULT_MODEL;
     return openai(name);
 }
 
@@ -183,7 +183,7 @@ export async function summarisePaper(paper: string): Promise<string> {
         model: getResearchModel(3),
         messages: [
             { role: "system", content: "Summarise the following research paper into exactly 3 concise bullet points. Each bullet should capture a key finding. Output ONLY the 3 bullets, no other text." },
-            { role: "user", content: paper.slice(0, 6000) },
+            { role: "user", content: paper.slice(0, 12000) },
         ],
         ...withTelemetry("research.summariser"),
     } as Parameters<typeof generateText>[0]);

@@ -20,7 +20,7 @@
 import { generateText, type ModelMessage } from "ai";
 import { openai } from "@ai-sdk/openai";
 import type { StandardMessage, StandardResponse } from "@/types/messaging";
-import { getChatHistory, saveChatMessages, createJob, getJob, updateJob, clearActiveJob, getPendingPatch, getPendingPush, type DevJob, type DevJobPhase } from "@/lib/redis";
+import { getChatHistory, saveChatMessages, createJob, getJob, updateJob, clearActiveJob, getPendingPatch, getPendingPush, pushHostCommand, pollResult, type DevJob, type DevJobPhase } from "@/lib/redis";
 import { getUserProfile, formatProfileForPrompt } from "./memory";
 import { aiTools, makeAiTools } from "./tools";
 import { withTelemetry } from "./telemetry";
@@ -214,15 +214,13 @@ export function isResearchRequest(text: string): boolean {
 export function isDevFeatureRequest(text: string): boolean {
     const t = text.trim().toLowerCase();
     const triggers = [
-        "build ",
-        "implement ",
         "add feature",
         "add a feature",
-        "create a ",
-        "create ",
-        "add ",
-        "implementing ",
-        "building ",
+        "implement a ",
+        "implement the ",
+        "add a new ",
+        "create a new ",
+        "build a new ",
     ];
     return triggers.some((phrase) => t.includes(phrase));
 }
@@ -258,7 +256,11 @@ const SELF_AWARENESS_HINT = process.env.EUREKA_SELF_PATH
     : "";
 
 const SYSTEM_PROMPT_NORMAL =
-    "You are a helpful coding assistant. First infer the user's intent from their message, then choose the single best tool (or answer directly) to fulfil that intent. " +
+    "You are Eureka, a personal AI assistant that can both write code AND directly control the user's Windows PC via tools. " +
+    "You can open apps (open_app), take webcam photos (capture_webcam), control Spotify, manage files, run git operations, and more. " +
+    "Always use tools to fulfil requests — NEVER tell the user to do something themselves when you have a tool that can do it. " +
+    "First infer the user's intent, then use the best tool(s) in sequence to fulfil it — chain multiple tools when needed. " +
+    "When the user asks you to send or share a file: first call find_file to locate it, then call send_file_to_telegram with the returned path. Do not stop after find_file. " +
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
     "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, remove_lines_matching, or delete_code) so they can resolve the path themselves. " +
     "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
@@ -539,9 +541,6 @@ function extractButtonActions(
 async function autoApplyAll(
     toolResults: Array<{ result?: unknown; output?: unknown; toolName?: string }>,
 ): Promise<{ applied: number; pushed: boolean; errors: string[] }> {
-    const daemonUrl = process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "");
-    if (!daemonUrl) return { applied: 0, pushed: false, errors: ["LOCAL_DAEMON_URL not configured"] };
-
     const actions = extractButtonActions(toolResults);
     let applied = 0;
     let pushed = false;
@@ -556,13 +555,9 @@ async function autoApplyAll(
                 if (!staged) { errors.push(`Patch ${patchId} expired`); continue; }
                 const workspace = staged.workspace_path?.trim() || process.env.LOCAL_DAEMON_WORKSPACE_PATH?.trim();
                 if (!workspace) { errors.push(`No workspace for patch ${patchId}`); continue; }
-                const res = await fetch(`${daemonUrl}/apply-patch`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ patch_string: staged.patch_string, workspace_path: workspace }),
-                });
-                const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
-                if (data.success) {
+                const taskId = await pushHostCommand("apply_patch", { patch_string: staged.patch_string, workspace_path: workspace });
+                const data = (await pollResult(taskId)) as { success?: boolean; message?: string };
+                if (data.success === true) {
                     applied++;
                     console.info(`[orchestrator:dev] Auto-applied patch ${patchId}`);
                 } else {
@@ -582,13 +577,9 @@ async function autoApplyAll(
             try {
                 const staged = await getPendingPush(pushId);
                 if (!staged) { errors.push(`Push ${pushId} expired`); continue; }
-                const res = await fetch(`${daemonUrl}/git/commit-and-push`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ workspace_path: staged.workspace_path, commit_message: staged.commit_message }),
-                });
-                const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
-                if (data.success) {
+                const taskId = await pushHostCommand("git_commit_and_push", { workspace_path: staged.workspace_path, commit_message: staged.commit_message });
+                const data = (await pollResult(taskId)) as { success?: boolean; message?: string };
+                if (data.success === true) {
                     pushed = true;
                     console.info(`[orchestrator:dev] Auto-pushed ${pushId}`);
                 } else {
@@ -896,7 +887,6 @@ async function processDev(
 // ---------------------------------------------------------------------------
 
 const MAX_PHASE_ATTEMPTS = 3;
-const daemonUrl = () => process.env.LOCAL_DAEMON_URL?.replace(/\/+$/, "") ?? "";
 
 interface DecomposedProject {
     project_name: string;
@@ -906,12 +896,8 @@ interface DecomposedProject {
 
 async function commitPhase(workspacePath: string, message: string): Promise<{ success: boolean; error?: string }> {
     try {
-        const res = await fetch(`${daemonUrl()}/git/commit-all`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ workspace_path: workspacePath, commit_message: message }),
-        });
-        const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+        const taskId = await pushHostCommand("git_commit_all", { workspace_path: workspacePath, commit_message: message });
+        const data = (await pollResult(taskId)) as { success?: boolean; message?: string };
         return { success: data.success === true, error: data.message };
     } catch (e) {
         return { success: false, error: e instanceof Error ? e.message : String(e) };
@@ -920,12 +906,8 @@ async function commitPhase(workspacePath: string, message: string): Promise<{ su
 
 async function pushRepo(workspacePath: string, commitMessage: string): Promise<{ success: boolean; error?: string }> {
     try {
-        const res = await fetch(`${daemonUrl()}/git/commit-and-push`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ workspace_path: workspacePath, commit_message: commitMessage }),
-        });
-        const data = (await res.json().catch(() => ({}))) as { success?: boolean; message?: string };
+        const taskId = await pushHostCommand("git_commit_and_push", { workspace_path: workspacePath, commit_message: commitMessage });
+        const data = (await pollResult(taskId)) as { success?: boolean; message?: string };
         return { success: data.success === true, error: data.message };
     } catch (e) {
         return { success: false, error: e instanceof Error ? e.message : String(e) };
@@ -1182,7 +1164,7 @@ async function processDevMultiPhase(
 
         if (!workspacePath) {
             // Fallback: construct from default workspace + project name
-            const defaultWs = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "C:/Users/madus/Desktop";
+            const defaultWs = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
             workspacePath = `${defaultWs}/${projectName}`;
             console.warn(`[orchestrator:multi] Could not extract workspace_path from setup, using fallback: ${workspacePath}`);
         }

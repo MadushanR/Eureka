@@ -77,10 +77,7 @@ SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
 TASK_QUEUE = "eureka:host_commands"
-# URL of the Next.js orchestrator — used for streaming build callbacks.
-# e.g. "https://your-app.vercel.app" or "http://localhost:3000"
-ORCHESTRATOR_CALLBACK_URL = os.environ.get("ORCHESTRATOR_CALLBACK_URL", "")
-# How often (seconds) to flush the output buffer back to the orchestrator.
+# How often (seconds) to flush the output buffer back to Telegram.
 _CLAUDE_STREAM_INTERVAL = 5.0
 
 if not REDIS_URL:
@@ -136,33 +133,8 @@ def _tg(chat_id: str, text: str, bot_token: str | None = None) -> None:
 # Streaming callback helper
 # ---------------------------------------------------------------------------
 
-def _post_worker_callback(
-    text: str,
-    sender_id: str,
-    task_id: str,
-    bot_token: str,
-    callback_url: str,
-) -> None:
-    """
-    POST a streaming chunk to the Next.js /api/worker-callback endpoint.
-    Falls back to direct Telegram delivery if no callback URL is configured.
-    """
-    if callback_url:
-        try:
-            requests.post(
-                f"{callback_url.rstrip('/')}/api/worker-callback",
-                json={
-                    "sender_id": sender_id,
-                    "task_id": task_id,
-                    "text": text,
-                    "bot_token": bot_token,
-                },
-                timeout=15,
-            )
-            return
-        except Exception as exc:
-            log.warning("[claude-stream] Callback POST failed (%s); falling back to Telegram.", exc)
-    # Fallback: send directly via Telegram
+def _post_worker_callback(text: str, sender_id: str, bot_token: str) -> None:
+    """Send a streaming chunk directly to Telegram."""
     _tg(sender_id, text, bot_token)
 
 
@@ -350,7 +322,7 @@ def _handle_git_commit_all(payload: dict) -> dict:
 
     _git(["add", "-A"], resolved)
     ok, out, err = _git(["commit", "-m", commit_message], resolved)
-    if not ok and "nothing to commit" not in err.lower():
+    if not ok and "nothing to commit" not in err.lower() and "nothing to commit" not in out.lower():
         return {"success": False, "message": f"Commit failed: {err.strip()[:400]}"}
 
     return {"success": True, "message": "Committed. " + out.strip()[:200]}
@@ -461,7 +433,7 @@ def _handle_list_folder_contents(payload: dict) -> dict:
         for entry in Path(resolved).iterdir():
             entries.append({
                 "name": entry.name,
-                "type": "directory" if entry.is_dir() else "file",
+                "type": "folder" if entry.is_dir() else "file",
                 "path": str(entry),
             })
         entries.sort(key=lambda e: (e["type"] == "file", e["name"].lower()))
@@ -1075,8 +1047,8 @@ def _handle_open_app(payload: dict) -> dict:
          Launches the first match via Invoke-Item, which respects the shortcut's
          target, working directory, and run-as settings.
       2. If no shortcut is found, fall back to Start-Process <app_name>, which
-         resolves executables registered under HKLM\SOFTWARE\Microsoft\Windows\
-         CurrentVersion\App Paths (e.g. 'chrome', 'code', 'msedge', 'excel').
+         resolves executables registered under HKLM\\SOFTWARE\\Microsoft\\Windows\\
+         CurrentVersion\\App Paths (e.g. 'chrome', 'code', 'msedge', 'excel').
 
     The PowerShell host process runs with -WindowStyle Hidden and -NonInteractive
     so no console window flashes on screen.  The launched application itself
@@ -1703,9 +1675,7 @@ def _handle_run_claude_code_streaming(task: dict) -> None:
     waiting up to 20 minutes for the process to finish.
 
     Output is buffered for _CLAUDE_STREAM_INTERVAL seconds and then flushed
-    as a Markdown code block to the Next.js /api/worker-callback endpoint
-    (falling back to direct Telegram delivery if ORCHESTRATOR_CALLBACK_URL is
-    not set).
+    as a Markdown code block directly to Telegram.
 
     This function manages its own result routing; dispatch() must return
     immediately after calling it.
@@ -1713,15 +1683,12 @@ def _handle_run_claude_code_streaming(task: dict) -> None:
     payload:      dict       = task.get("payload", {})
     sender_id:    str | None = task.get("sender_id")
     bot_token:    str        = task.get("bot_token", BOT_TOKEN) or BOT_TOKEN
-    task_id:      str        = task.get("task_id", "?")
-    callback_url: str        = payload.get("callback_url", ORCHESTRATOR_CALLBACK_URL)
-
     if not sender_id:
         log.warning("[claude-stream] task has no sender_id — cannot stream output.")
         return
 
     def _send(text: str) -> None:
-        _post_worker_callback(text, sender_id, task_id, bot_token, callback_url)
+        _post_worker_callback(text, sender_id, bot_token)
 
     # ------------------------------------------------------------------
     # 1. Validate prompt

@@ -335,7 +335,7 @@ async function handlePushAction(message: StandardMessage): Promise<boolean> {
 /** Handle push-only button: run git push without staging/committing. */
 async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> {
     const prefix = "push_only:";
-    if (!message.text.startsWith(prefix)) return false;
+    if (!message.isAction || !message.text.startsWith(prefix)) return false;
 
     const pushOnlyId = message.text.slice(prefix.length).trim();
     if (!pushOnlyId) return false;
@@ -448,7 +448,7 @@ async function runResearchInBackground(
         const result = await runResearchPipeline(topic, onProgress, getIsCancelled, { targetWords });
 
         // Save paper as PDF on Desktop via the Redis worker queue.
-        const workspacePath = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "C:/Users/madus/Desktop";
+        const workspacePath = process.env.LOCAL_DAEMON_WORKSPACE_PATH ?? "";
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const filename = `research-paper-${timestamp}.pdf`;
 
@@ -520,8 +520,7 @@ const FULL_BUILD_INTENT_PHRASES = [
     "create from scratch",
     "build a whole",
     "create a whole",
-    "build me a whole app",
-    "build me a whole application",
+    "build me a whole ",
 ];
 
 function isFullBuildIntent(text: string): boolean {
@@ -821,8 +820,14 @@ async function processMessage(message: StandardMessage): Promise<void> {
                 message.senderId,
             );
 
-            // Fire-and-forget: dev agent runs in the background
-            void runDevAgentInBackground(message, tgAdapter);
+            // Use waitUntil so Vercel keeps the process alive for the full dev agent run.
+            try {
+                const { waitUntil } = await import("@vercel/functions");
+                waitUntil(runDevAgentInBackground(message, tgAdapter));
+            } catch {
+                // Not running on Vercel (local dev) — fire-and-forget is fine.
+                void runDevAgentInBackground(message, tgAdapter);
+            }
             return;
         }
 

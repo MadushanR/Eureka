@@ -47,7 +47,7 @@ async function workerCall(
 ): Promise<{ success: boolean; message?: string; error?: string; [k: string]: unknown }> {
     try {
         const result = (await callWorker(action, payload)) as { success?: boolean; message?: string; error?: string; [k: string]: unknown };
-        return { ...result, success: result.success !== false };
+        return { ...result, success: result.success === true };
     } catch (e) {
         return { success: false, error: e instanceof Error ? e.message : "Worker error." };
     }
@@ -1252,6 +1252,19 @@ export const openUrl = tool({
     },
 });
 
+export const openApp = tool({
+    description:
+        "Launch a Windows application by name on the user's PC. " +
+        "Use when the user asks to open, start, or launch any app — e.g. 'open Spotify', 'launch VS Code', 'open Chrome', 'start Notepad'. " +
+        "Accepts partial or full app names; the worker resolves them via Start Menu shortcuts and Windows App Paths.",
+    inputSchema: z.object({
+        app_name: z.string().describe("Partial or full application name, e.g. 'spotify', 'VS Code', 'chrome', 'notepad'."),
+    }),
+    async execute({ app_name }: { app_name: string }): Promise<unknown> {
+        return workerCall("open_app", { app_name });
+    },
+});
+
 /**
  * Tool: find_file
  * ---------------
@@ -1290,7 +1303,6 @@ const baseAiTools = {
     delete_code: deleteCode,
     insert_code: insertCode,
     edit_file: editFile,
-    request_patch_approval: requestPatchApproval,
     remove_line: removeLine,
     remove_lines_matching: removeLinesMatching,
     prepare_push_approval: preparePushApproval,
@@ -1316,6 +1328,7 @@ const baseAiTools = {
     system_sleep: systemSleep,
     system_lock: systemLock,
     open_url: openUrl,
+    open_app: openApp,
 };
 
 /**
@@ -1348,9 +1361,87 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    const captureWebcam = tool({
+        description:
+            "Snap a photo from the PC's webcam and send it instantly to this Telegram chat. " +
+            "Use when the user asks to take a photo, capture a webcam image, or see what's in front of the camera.",
+        inputSchema: z.object({}),
+        async execute(): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set in environment." };
+            try {
+                return await callWorker("capture_webcam", {
+                    chat_id: senderId,
+                    bot_token: botToken,
+                });
+            } catch (e) {
+                return { error: e instanceof Error ? e.message : "Worker error capturing webcam." };
+            }
+        },
+    });
+
+    const rescueFile = tool({
+        description:
+            "Find a file by name on the home PC and upload it directly to this Telegram chat. " +
+            "Searches under %USERPROFILE% (Desktop, Documents, Downloads, and coding folders). " +
+            "Use when the user asks to send, fetch, or retrieve a specific file from their PC (e.g. 'send me Resume.pdf', 'get AWS_keys.env').",
+        inputSchema: z.object({
+            file_name: z
+                .string()
+                .min(1, "file_name must not be empty.")
+                .describe("Exact filename to search for, e.g. 'Resume.pdf' or 'AWS_keys.env'."),
+        }),
+        async execute({ file_name }: { file_name: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set in environment." };
+            try {
+                return await callWorker("rescue_file", {
+                    file_name,
+                    chat_id: senderId,
+                    bot_token: botToken,
+                });
+            } catch (e) {
+                return { error: e instanceof Error ? e.message : "Worker error rescuing file." };
+            }
+        },
+    });
+
+    const remoteDownload = tool({
+        description:
+            "Download a URL on the home PC in the background and notify when complete. " +
+            "Supports YouTube / Twitter / Vimeo video links (uses yt-dlp for best quality), " +
+            "direct file URLs ending in .zip / .pdf / .csv / etc. (streamed to disk), " +
+            "and magnet: links (passed to aria2c). " +
+            "Sends a confirmation immediately and a 'Download Complete' message when finished. " +
+            "Use when the user says 'download this for me', 'save this video', 'grab this file', etc.",
+        inputSchema: z.object({
+            url: z
+                .string()
+                .min(1, "url must not be empty.")
+                .describe("The URL to download — a YouTube link, direct file URL, or magnet: URI."),
+        }),
+        async execute({ url }: { url: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set in environment." };
+            try {
+                // Short timeout: the worker starts a background thread and returns immediately.
+                return await callWorker("remote_download", {
+                    url,
+                    chat_id: senderId,
+                    bot_token: botToken,
+                }, 10_000);
+            } catch (e) {
+                return { error: e instanceof Error ? e.message : "Worker error starting download." };
+            }
+        },
+    });
+
     return {
         ...baseAiTools,
         send_file_to_telegram: sendFileToTelegram,
+        capture_webcam: captureWebcam,
+        rescue_file: rescueFile,
+        remote_download: remoteDownload,
     };
 }
 
