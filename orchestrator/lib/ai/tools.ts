@@ -1540,8 +1540,47 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    // Combined find + send — use this when the user wants to receive a file.
+    // Avoids relying on the LLM to chain find_file → send_file_to_telegram.
+    const sendFile = tool({
+        description:
+            "Find a file on the local PC by name and send it to this Telegram chat in one step. " +
+            "Use this whenever the user asks to send, share, or receive a file. " +
+            "Pass the filename (or partial name) and optionally a folder_path to narrow the search.",
+        inputSchema: z.object({
+            name_pattern: z.string().describe("Filename substring to search for (case-insensitive)."),
+            folder_path: z.string().optional().describe("Absolute path to search in. Leave empty to search all workspaces."),
+            caption: z.string().optional().describe("Optional caption to include with the file."),
+        }),
+        async execute({ name_pattern, folder_path, caption }: { name_pattern: string; folder_path?: string; caption?: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { success: false, error: "TELEGRAM_BOT_TOKEN not set." };
+            // Step 1: find the file
+            let found: { success?: boolean; files?: Array<{ path: string; name: string }> };
+            try {
+                found = await callWorker("find_file", { name_pattern, folder_path, max_results: 5 }) as typeof found;
+            } catch (e) {
+                return { success: false, error: `find_file failed: ${e instanceof Error ? e.message : e}` };
+            }
+            if (!found.files?.length) return { success: false, error: `No file matching "${name_pattern}" found.` };
+            const file = found.files[0];
+            // Step 2: send it
+            try {
+                return await callWorker("send_file_to_telegram", {
+                    file_path: file.path,
+                    chat_id: senderId,
+                    bot_token: botToken,
+                    caption: caption ?? "",
+                }, 90_000);
+            } catch (e) {
+                return { success: false, error: `send failed: ${e instanceof Error ? e.message : e}` };
+            }
+        },
+    });
+
     return {
         ...baseAiTools,
+        send_file: sendFile,
         send_file_to_telegram: sendFileToTelegram,
         capture_webcam: captureWebcam,
         rescue_file: rescueFile,

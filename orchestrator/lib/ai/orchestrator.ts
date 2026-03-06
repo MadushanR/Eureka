@@ -260,7 +260,7 @@ const SYSTEM_PROMPT_NORMAL =
     "You can open apps (open_app), take webcam photos (capture_webcam), control Spotify, manage files, run git operations, and more. " +
     "Always use tools to fulfil requests — NEVER tell the user to do something themselves when you have a tool that can do it. " +
     "First infer the user's intent, then use the best tool(s) in sequence to fulfil it — chain multiple tools when needed. " +
-    "When the user asks you to send or share a file: ALWAYS call find_file first, then IMMEDIATELY call send_file_to_telegram with the path from the result. These are two mandatory sequential steps — find_file alone is never sufficient. " +
+    "When the user asks you to send, share, or receive a file: use the send_file tool — it finds and delivers the file in one step. Do NOT use find_file followed by send_file_to_telegram. " +
     "Use the available tools based on their descriptions; do not follow fixed recipes. " +
     "When the user names a repo (for example 'Eureka'), pass that name as repo_name to tools that accept it (such as get_uncommitted_changes, remove_line, remove_lines_matching, or delete_code) so they can resolve the path themselves. " +
     "When the user asks to delete a function, endpoint, or class (e.g. 'delete the GET /testing'), use delete_code with the search_term that identifies it (e.g. '/testing'). Do NOT use remove_line for this — delete_code removes the entire block. " +
@@ -1220,8 +1220,6 @@ async function processDevMultiPhase(
     // -----------------------------------------------------------------------
     const allFilesCreated: string[] = [];
     const phaseSummaries: string[] = [];
-    let lastPhaseSucceeded = true;
-
     for (let i = 0; i < phases.length; i++) {
         // Check cancellation
         const currentJob = await getJob(job.id);
@@ -1269,8 +1267,6 @@ async function processDevMultiPhase(
         } else {
             jobPhases[i].status = "failed";
             phaseSummaries.push(`Phase ${phaseNum} (${phase.name}): Failed — ${phaseResult.text.slice(0, 100)}`);
-            lastPhaseSucceeded = false;
-
             // Still commit whatever was created, then continue
             await commitPhase(workspacePath, `wip: partial ${phase.name.toLowerCase()}`);
             await progress(`Phase ${phaseNum} had issues but continuing: ${phaseResult.text.slice(0, 80)}`);
