@@ -2014,7 +2014,7 @@ def _handle_send_file_to_telegram(payload: dict) -> dict:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption
-            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(10, 75))
+            resp = requests.post(url, files={field: (path.name, fh)}, data=data, timeout=(30, 120))
         result = resp.json()
         if result.get("ok"):
             log.info("[send_file] success: %s", path.name)
