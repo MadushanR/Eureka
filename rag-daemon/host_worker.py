@@ -1342,6 +1342,11 @@ def _handle_system_unlock(_payload: dict) -> dict:
 
     import pyautogui
 
+    # Disable fail-safe: on a locked screen the cursor is often parked in a
+    # corner, which triggers PyAutoGUI's fail-safe.  We restore it after.
+    original_failsafe = pyautogui.FAILSAFE
+    pyautogui.FAILSAFE = False
+
     errors: list[str] = []
 
     # 1. Wake the display — send SC_MONITORPOWER with param -1 (on).
@@ -1382,6 +1387,7 @@ def _handle_system_unlock(_payload: dict) -> dict:
         pyautogui.typewrite(UNLOCK_PIN, interval=0.05)
     except Exception as exc:
         errors.append(f"PIN entry failed: {exc}")
+        pyautogui.FAILSAFE = original_failsafe
         return {"success": False, "error": "; ".join(errors)}
 
     # 6. Submit.
@@ -1390,6 +1396,9 @@ def _handle_system_unlock(_payload: dict) -> dict:
         pyautogui.press("enter")
     except Exception as exc:
         errors.append(f"submit failed: {exc}")
+
+    # Restore fail-safe.
+    pyautogui.FAILSAFE = original_failsafe
 
     if errors:
         return {"success": False, "message": "Unlock partially applied.", "errors": errors}
