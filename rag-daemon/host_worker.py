@@ -76,6 +76,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
+UNLOCK_PIN = os.environ.get("UNLOCK_PIN", "")
 TASK_QUEUE = "eureka:host_commands"
 # How often (seconds) to flush the output buffer back to Telegram.
 _CLAUDE_STREAM_INTERVAL = 5.0
@@ -1315,6 +1316,84 @@ def _handle_system_sleep(_payload: dict) -> dict:
         return {"success": True, "message": "Sleep initiated."}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _handle_system_unlock(_payload: dict) -> dict:
+    """
+    Unlock a locked Windows PC by waking the display and auto-typing the
+    stored PIN/password.
+
+    Sequence:
+      1. Wake the display (turn monitors on via SendMessageW SC_MONITORPOWER).
+      2. Brief pause for the lock screen to render.
+      3. Dismiss the "click to unlock" overlay (press Enter).
+      4. Brief pause for the PIN entry field to appear.
+      5. Type the PIN via pyautogui.typewrite().
+      6. Press Enter to submit.
+
+    Requires UNLOCK_PIN to be set in .env.
+    Must run in an interactive Windows session (Session 1), not as a service.
+    """
+    if platform.system() != "Windows":
+        return {"success": False, "error": "system_unlock is Windows-only."}
+
+    if not UNLOCK_PIN:
+        return {"success": False, "error": "UNLOCK_PIN is not set in .env. Cannot unlock."}
+
+    import pyautogui
+
+    errors: list[str] = []
+
+    # 1. Wake the display — send SC_MONITORPOWER with param -1 (on).
+    try:
+        HWND_BROADCAST  = 0xFFFF
+        WM_SYSCOMMAND   = 0x0112
+        SC_MONITORPOWER = 0xF170
+        MONITOR_ON      = -1
+        ctypes.windll.user32.SendMessageW(
+            HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_ON
+        )
+    except Exception as exc:
+        errors.append(f"monitor wake failed: {exc}")
+
+    # Also move the mouse slightly to ensure Windows wakes from idle.
+    try:
+        pyautogui.moveRel(1, 0)
+        time.sleep(0.1)
+        pyautogui.moveRel(-1, 0)
+    except Exception:
+        pass
+
+    # 2. Wait for lock screen to render.
+    time.sleep(1.5)
+
+    # 3. Dismiss the "click to sign in" overlay by pressing Enter.
+    try:
+        pyautogui.press("enter")
+    except Exception as exc:
+        errors.append(f"dismiss overlay failed: {exc}")
+
+    # 4. Wait for the PIN entry field to appear.
+    time.sleep(1.5)
+
+    # 5. Type the PIN. interval=0.05 adds a small delay between keystrokes
+    #    to ensure each one is registered on the lock screen.
+    try:
+        pyautogui.typewrite(UNLOCK_PIN, interval=0.05)
+    except Exception as exc:
+        errors.append(f"PIN entry failed: {exc}")
+        return {"success": False, "error": "; ".join(errors)}
+
+    # 6. Submit.
+    time.sleep(0.2)
+    try:
+        pyautogui.press("enter")
+    except Exception as exc:
+        errors.append(f"submit failed: {exc}")
+
+    if errors:
+        return {"success": False, "message": "Unlock partially applied.", "errors": errors}
+    return {"success": True, "message": "PC unlocked."}
 
 
 def _handle_lockdown_pc(_payload: dict) -> dict:
@@ -2639,6 +2718,7 @@ HANDLERS: dict[str, Any] = {
     "system_shutdown": _handle_system_shutdown,
     "system_restart": _handle_system_restart,
     "system_sleep": _handle_system_sleep,
+    "system_unlock": _handle_system_unlock,
     "lockdown_pc": _handle_lockdown_pc,
     # Task manager
     "list_apps": _handle_list_apps,

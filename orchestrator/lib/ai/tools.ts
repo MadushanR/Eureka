@@ -1277,6 +1277,15 @@ export const systemLock = tool({
     async execute(): Promise<unknown> { return workerCall("system_lock"); },
 });
 
+export const systemUnlock = tool({
+    description:
+        "Unlock the user's locked PC by waking the display and auto-typing the stored PIN. " +
+        "Use when the user asks to unlock their computer or unlock the screen. " +
+        "Requires UNLOCK_PIN to be configured in the daemon's .env file.",
+    inputSchema: z.object({}),
+    async execute(): Promise<unknown> { return workerCall("system_unlock"); },
+});
+
 export const openUrl = tool({
     description:
         "Open a URL in the default browser on the user's local machine. " +
@@ -1405,6 +1414,7 @@ const baseAiTools = {
     system_restart: systemRestart,
     system_sleep: systemSleep,
     system_lock: systemLock,
+    system_unlock: systemUnlock,
     open_url: openUrl,
     open_app: openApp,
     close_app: closeApp,
