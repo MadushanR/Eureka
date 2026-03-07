@@ -42,3 +42,7 @@ pywin32>=306                       # win32gui/win32process for visible-window en
 screen-brightness-control>=0.23.0  # DDC/CI + WMI brightness for adjust_brightness
 opencv-python>=4.9.0               # Webcam capture for capture_webcam action
 yt-dlp>=2024.1.0                   # Video download for remote_download action
+mss>=9.0.0                         # Fast cross-platform screen capture (take_screenshot)
+playwright>=1.44.0                 # Browser automation — also run: playwright install chromium
+pyautogui>=0.9.54                  # Mouse/keyboard GUI automation (gui_action)
+pygetwindow>=0.0.9                 # Window title enumeration & focus (manage_windows)

@@ -9,7 +9,8 @@
  *   - spotify_*               — Control Spotify via the daemon (play, pause, next, etc.).
  */
 
-import { tool } from "ai";
+import { tool, generateText } from "ai";
+import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import type { InteractiveButton, StandardResponse } from "@/types/messaging";
 import { stagePatch, stagePush, stagePushOnly, pushHostCommand, pollResult } from "@/lib/redis";
@@ -1585,6 +1586,135 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    const takeScreenshot = tool({
+        description: "Capture the user's entire screen and send the photo to Telegram.",
+        inputSchema: z.object({
+            caption: z.string().optional().describe("Optional caption shown under the screenshot."),
+        }),
+        async execute({ caption }: { caption?: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set." };
+            try {
+                return await callWorker("take_screenshot", {
+                    chat_id: senderId,
+                    bot_token: botToken,
+                    caption: caption ?? "",
+                }, 30_000);
+            } catch (e) {
+                return { success: false, error: e instanceof Error ? e.message : "Screenshot failed." };
+            }
+        },
+    });
+
+    const analyzeScreen = tool({
+        description:
+            "Capture the screen, send it to Telegram, then analyze what is visible using vision AI. " +
+            "Use this when the user asks what is on their screen or wants you to read/describe screen content.",
+        inputSchema: z.object({
+            question: z.string().optional().describe("Specific question about what to look for on screen."),
+        }),
+        async execute({ question }: { question?: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set." };
+            try {
+                const raw = await callWorker("take_screenshot", {
+                    chat_id: senderId,
+                    bot_token: botToken,
+                    return_base64: true,
+                }, 30_000) as { base64_image?: string; success?: boolean; error?: string };
+                if (!raw.base64_image) return { success: false, error: raw.error ?? "No image returned." };
+                const { text } = await generateText({
+                    model: openai(process.env.LLM_MODEL_NAME ?? "gpt-4o"),
+                    messages: [{
+                        role: "user",
+                        content: [
+                            { type: "image", image: Buffer.from(raw.base64_image, "base64") },
+                            { type: "text", text: question ?? "Describe everything visible on this screen in detail." },
+                        ],
+                    }],
+                });
+                return { analysis: text };
+            } catch (e) {
+                return { success: false, error: e instanceof Error ? e.message : "Screen analysis failed." };
+            }
+        },
+    });
+
+    const browserAction = tool({
+        description:
+            "Control a Chromium browser: open URLs, navigate, click elements, fill forms, extract page text, scroll, or take a page screenshot. " +
+            "Always call with action='open' before using other actions on a fresh session.",
+        inputSchema: z.object({
+            action: z.enum(["open", "navigate", "screenshot", "click", "type", "extract", "scroll", "fill_form", "close"])
+                .describe("Browser action to perform."),
+            url: z.string().optional().describe("URL for open/navigate actions."),
+            selector: z.string().optional().describe("CSS selector for click/type/extract actions."),
+            text: z.string().optional().describe("Visible text to click (alternative to selector)."),
+            value: z.string().optional().describe("Text to fill into a field (type action)."),
+            fields: z.record(z.string(), z.string()).optional().describe("Map of CSS selector to value for fill_form action."),
+            dx: z.number().optional().describe("Horizontal scroll amount in pixels."),
+            dy: z.number().optional().describe("Vertical scroll amount in pixels (positive = down)."),
+            headless: z.boolean().optional().describe("Run browser headless (invisible). Defaults to false."),
+            caption: z.string().optional().describe("Caption for screenshot action."),
+        }),
+        async execute({ action, url, selector, text, value, fields, dx, dy, headless, caption }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            try {
+                return await callWorker("browser", {
+                    action, url, selector, text, value, fields, dx, dy, headless, caption,
+                    chat_id: senderId,
+                    bot_token: botToken ?? "",
+                }, 45_000);
+            } catch (e) {
+                return { success: false, error: e instanceof Error ? e.message : "Browser action failed." };
+            }
+        },
+    });
+
+    const guiAction = tool({
+        description:
+            "Control the mouse and keyboard: click, double-click, right-click, type text, press hotkeys, scroll, move mouse, or drag. " +
+            "Use take_screenshot first to find coordinates if needed.",
+        inputSchema: z.object({
+            action: z.enum(["click", "double_click", "right_click", "type", "hotkey", "press", "scroll", "move", "drag", "get_position"])
+                .describe("GUI action to perform."),
+            x: z.number().optional().describe("X coordinate (pixels from left)."),
+            y: z.number().optional().describe("Y coordinate (pixels from top)."),
+            x2: z.number().optional().describe("Destination X for drag action."),
+            y2: z.number().optional().describe("Destination Y for drag action."),
+            text: z.string().optional().describe("Text to type."),
+            keys: z.string().optional().describe("Hotkey combination, e.g. 'ctrl+c' or 'alt+tab'."),
+            key: z.string().optional().describe("Single key to press, e.g. 'enter', 'escape', 'f5'."),
+            clicks: z.number().optional().describe("Scroll amount (positive = up, negative = down)."),
+            button: z.string().optional().describe("Mouse button: 'left', 'right', or 'middle'."),
+            duration: z.number().optional().describe("Duration in seconds for move/drag."),
+            interval: z.number().optional().describe("Delay between keystrokes in seconds for type action."),
+        }),
+        async execute({ action, x, y, x2, y2, text, keys, key, clicks, button, duration, interval }): Promise<unknown> {
+            try {
+                return await callWorker("gui_action", { action, x, y, x2, y2, text, keys, key, clicks, button, duration, interval }, 15_000);
+            } catch (e) {
+                return { success: false, error: e instanceof Error ? e.message : "GUI action failed." };
+            }
+        },
+    });
+
+    const manageWindows = tool({
+        description: "List all open windows or bring a specific window to the foreground by its title.",
+        inputSchema: z.object({
+            action: z.enum(["list", "focus"]).describe("'list' returns all window titles; 'focus' brings a window to front."),
+            title_contains: z.string().optional().describe("Case-insensitive substring of the window title to focus."),
+        }),
+        async execute({ action, title_contains }: { action: string; title_contains?: string }): Promise<unknown> {
+            try {
+                if (action === "list") return await callWorker("get_windows", {}, 10_000);
+                return await callWorker("focus_window", { title_contains }, 10_000);
+            } catch (e) {
+                return { success: false, error: e instanceof Error ? e.message : "Window management failed." };
+            }
+        },
+    });
+
     // Remove find_file from the sender-aware tool set so the LLM uses
     // send_file (which chains find + send) instead of stopping after find_file.
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1598,6 +1728,11 @@ export function makeAiTools(senderId: string) {
         rescue_file: rescueFile,
         remote_download: remoteDownload,
         run_claude_code: runClaudeCode,
+        take_screenshot: takeScreenshot,
+        analyze_screen: analyzeScreen,
+        browser_action: browserAction,
+        gui_action: guiAction,
+        manage_windows: manageWindows,
     };
 }
 

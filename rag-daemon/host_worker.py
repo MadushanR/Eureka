@@ -85,6 +85,27 @@ if not REDIS_URL:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
+# Playwright browser singleton (lazy-initialised on first use)
+# ---------------------------------------------------------------------------
+
+_pw_sync = None
+_pw_browser = None
+_pw_page = None  # type: ignore[assignment]
+
+
+def _ensure_browser(headless: bool = False):
+    """Return the active Playwright Page, creating the browser if needed."""
+    global _pw_sync, _pw_browser, _pw_page
+    from playwright.sync_api import sync_playwright  # noqa: PLC0415
+    if _pw_page is None or _pw_page.is_closed():
+        if _pw_sync is None:
+            _pw_sync = sync_playwright().start()
+        if _pw_browser is None or not _pw_browser.is_connected():
+            _pw_browser = _pw_sync.chromium.launch(headless=headless)
+        _pw_page = _pw_browser.new_page()
+    return _pw_page
+
+# ---------------------------------------------------------------------------
 # Path validation (mirrors config.py logic)
 # ---------------------------------------------------------------------------
 
@@ -2241,6 +2262,328 @@ def _handle_remote_download(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Screenshot handler
+# ---------------------------------------------------------------------------
+
+def _handle_take_screenshot(payload: dict) -> dict:
+    """Capture the primary monitor, optionally upload to Telegram and/or return base64."""
+    try:
+        import mss  # noqa: PLC0415
+        import mss.tools  # noqa: PLC0415
+        import base64  # noqa: PLC0415
+    except ImportError:
+        return {"success": False, "error": "mss is not installed. Run: pip install mss"}
+
+    chat_id = str(payload.get("chat_id", ""))
+    bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+    caption = payload.get("caption", "")
+    return_base64 = bool(payload.get("return_base64", False))
+
+    tmp = Path(os.environ.get("TEMP", "/tmp")) / "eureka_screenshot.png"
+    try:
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]  # primary monitor
+            sct_img = sct.grab(monitor)
+            mss.tools.to_png(sct_img.rgb, sct_img.size, output=str(tmp))
+
+        result: dict = {"success": True, "message": "Screenshot captured."}
+
+        # Upload to Telegram if requested
+        if chat_id and bot_token:
+            upload = _tg_upload(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                file_path=str(tmp),
+                method="sendPhoto",
+                field="photo",
+                caption=caption,
+            )
+            if not upload.get("success"):
+                result["telegram_error"] = upload.get("error", "Upload failed")
+            else:
+                result["message"] = "Screenshot sent to Telegram."
+
+        # Return base64-encoded JPEG if requested
+        if return_base64:
+            try:
+                from PIL import Image  # noqa: PLC0415
+                import io  # noqa: PLC0415
+                with Image.open(tmp) as img:
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=75)
+                    result["base64_image"] = base64.b64encode(buf.getvalue()).decode()
+            except ImportError:
+                # Fallback: return raw PNG as base64
+                result["base64_image"] = base64.b64encode(tmp.read_bytes()).decode()
+
+        return result
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Browser control handler (Playwright)
+# ---------------------------------------------------------------------------
+
+def _handle_browser(payload: dict) -> dict:
+    """Control a Chromium browser via Playwright."""
+    global _pw_page
+    action = payload.get("action", "")
+    try:
+        if action == "open":
+            url = payload.get("url", "")
+            if not url:
+                return {"success": False, "error": "url is required for open action."}
+            headless = bool(payload.get("headless", False))
+            page = _ensure_browser(headless=headless)
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return {"success": True, "message": f"Opened: {url}"}
+
+        elif action == "navigate":
+            url = payload.get("url", "")
+            if not url:
+                return {"success": False, "error": "url is required for navigate action."}
+            page = _ensure_browser()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return {"success": True, "message": f"Navigated to: {url}"}
+
+        elif action == "screenshot":
+            if _pw_page is None or _pw_page.is_closed():
+                return {"success": False, "error": "No browser page open. Use 'open' action first."}
+            chat_id = str(payload.get("chat_id", ""))
+            bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+            caption = payload.get("caption", "")
+            tmp = Path(os.environ.get("TEMP", "/tmp")) / "eureka_browser_screenshot.png"
+            try:
+                _pw_page.screenshot(path=str(tmp))
+                if chat_id and bot_token:
+                    return _tg_upload(
+                        bot_token=bot_token,
+                        chat_id=chat_id,
+                        file_path=str(tmp),
+                        method="sendPhoto",
+                        field="photo",
+                        caption=caption,
+                    )
+                return {"success": True, "message": "Browser screenshot captured."}
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        elif action == "click":
+            page = _ensure_browser()
+            selector = payload.get("selector", "")
+            text = payload.get("text", "")
+            if text:
+                page.get_by_text(text, exact=False).first.click(timeout=10000)
+            elif selector:
+                page.click(selector, timeout=10000)
+            else:
+                return {"success": False, "error": "selector or text is required for click action."}
+            return {"success": True, "message": f"Clicked: {selector or text!r}"}
+
+        elif action == "type":
+            page = _ensure_browser()
+            selector = payload.get("selector", "")
+            value = payload.get("value", "")
+            if not selector:
+                return {"success": False, "error": "selector is required for type action."}
+            page.fill(selector, value, timeout=10000)
+            return {"success": True, "message": f"Filled {selector!r} with value."}
+
+        elif action == "extract":
+            page = _ensure_browser()
+            selector = payload.get("selector", "body")
+            text = page.locator(selector).first.inner_text(timeout=10000)
+            return {"success": True, "content": text[:5000]}
+
+        elif action == "scroll":
+            page = _ensure_browser()
+            dx = float(payload.get("dx", 0))
+            dy = float(payload.get("dy", 300))
+            page.mouse.wheel(dx, dy)
+            return {"success": True, "message": f"Scrolled dx={dx} dy={dy}"}
+
+        elif action == "fill_form":
+            page = _ensure_browser()
+            fields: dict = payload.get("fields", {})
+            if not fields:
+                return {"success": False, "error": "fields dict is required for fill_form action."}
+            for sel, val in fields.items():
+                page.fill(sel, str(val), timeout=10000)
+            return {"success": True, "message": f"Filled {len(fields)} form fields."}
+
+        elif action == "close":
+            if _pw_page and not _pw_page.is_closed():
+                _pw_page.close()
+            _pw_page = None
+            return {"success": True, "message": "Browser page closed."}
+
+        else:
+            return {"success": False, "error": f"Unknown browser action: {action!r}"}
+
+    except ImportError:
+        return {"success": False, "error": "playwright is not installed. Run: pip install playwright && playwright install chromium"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# GUI automation handler (PyAutoGUI)
+# ---------------------------------------------------------------------------
+
+def _handle_gui_action(payload: dict) -> dict:
+    """Mouse/keyboard automation via PyAutoGUI."""
+    try:
+        import pyautogui  # noqa: PLC0415
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.1
+    except ImportError:
+        return {"success": False, "error": "pyautogui is not installed. Run: pip install pyautogui"}
+
+    action = payload.get("action", "")
+    try:
+        if action == "click":
+            x, y = int(payload["x"]), int(payload["y"])
+            button = payload.get("button", "left")
+            pyautogui.click(x, y, button=button)
+            return {"success": True, "message": f"Clicked {button} at ({x}, {y})"}
+
+        elif action == "double_click":
+            x, y = int(payload["x"]), int(payload["y"])
+            pyautogui.doubleClick(x, y)
+            return {"success": True, "message": f"Double-clicked at ({x}, {y})"}
+
+        elif action == "right_click":
+            x, y = int(payload["x"]), int(payload["y"])
+            pyautogui.rightClick(x, y)
+            return {"success": True, "message": f"Right-clicked at ({x}, {y})"}
+
+        elif action == "type":
+            text = payload.get("text", "")
+            interval = float(payload.get("interval", 0.05))
+            pyautogui.typewrite(text, interval=interval)
+            return {"success": True, "message": f"Typed {len(text)} characters."}
+
+        elif action == "hotkey":
+            keys_str = payload.get("keys", "")
+            if not keys_str:
+                return {"success": False, "error": "keys is required (e.g. 'ctrl+c')."}
+            keys = [k.strip() for k in keys_str.split("+")]
+            pyautogui.hotkey(*keys)
+            return {"success": True, "message": f"Pressed hotkey: {keys_str}"}
+
+        elif action == "press":
+            key = payload.get("key", "")
+            if not key:
+                return {"success": False, "error": "key is required."}
+            pyautogui.press(key)
+            return {"success": True, "message": f"Pressed key: {key}"}
+
+        elif action == "scroll":
+            x = int(payload.get("x", pyautogui.position().x))
+            y = int(payload.get("y", pyautogui.position().y))
+            clicks = int(payload.get("clicks", 3))
+            pyautogui.scroll(clicks, x=x, y=y)
+            return {"success": True, "message": f"Scrolled {clicks} clicks at ({x}, {y})"}
+
+        elif action == "move":
+            x, y = int(payload["x"]), int(payload["y"])
+            duration = float(payload.get("duration", 0.2))
+            pyautogui.moveTo(x, y, duration=duration)
+            return {"success": True, "message": f"Moved mouse to ({x}, {y})"}
+
+        elif action == "drag":
+            x1, y1 = int(payload["x"]), int(payload["y"])
+            x2, y2 = int(payload["x2"]), int(payload["y2"])
+            duration = float(payload.get("duration", 0.5))
+            pyautogui.moveTo(x1, y1)
+            pyautogui.dragTo(x2, y2, duration=duration, button="left")
+            return {"success": True, "message": f"Dragged from ({x1},{y1}) to ({x2},{y2})"}
+
+        elif action == "get_position":
+            pos = pyautogui.position()
+            return {"success": True, "x": pos.x, "y": pos.y}
+
+        else:
+            return {"success": False, "error": f"Unknown gui_action: {action!r}"}
+
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Window management handlers
+# ---------------------------------------------------------------------------
+
+def _handle_get_windows(_payload: dict) -> dict:
+    """List all visible top-level windows with non-empty titles."""
+    try:
+        import win32gui  # noqa: PLC0415
+        import win32con  # noqa: PLC0415
+    except ImportError:
+        return {"success": False, "error": "pywin32 is not installed."}
+
+    windows: list[dict] = []
+
+    def _enum_cb(hwnd: int, _: None) -> bool:
+        if (
+            win32gui.IsWindowVisible(hwnd)
+            and win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE) & win32con.WS_CAPTION
+        ):
+            title = win32gui.GetWindowText(hwnd)
+            if title:
+                windows.append({"hwnd": hwnd, "title": title})
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum_cb, None)
+        return {"success": True, "windows": windows}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _handle_focus_window(payload: dict) -> dict:
+    """Bring a window matching `title_contains` to the foreground."""
+    try:
+        import win32gui  # noqa: PLC0415
+        import win32con  # noqa: PLC0415
+    except ImportError:
+        return {"success": False, "error": "pywin32 is not installed."}
+
+    title_contains = payload.get("title_contains", "").lower()
+    if not title_contains:
+        return {"success": False, "error": "title_contains is required."}
+
+    matched: list[tuple[int, str]] = []
+
+    def _enum_cb(hwnd: int, _: None) -> bool:
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if title and title_contains in title.lower():
+                matched.append((hwnd, title))
+        return True
+
+    try:
+        win32gui.EnumWindows(_enum_cb, None)
+        if not matched:
+            return {"success": False, "error": f"No visible window matching {title_contains!r}."}
+        hwnd, title = matched[0]
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        return {"success": True, "message": f"Focused window: {title!r}"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -2309,6 +2652,15 @@ HANDLERS: dict[str, Any] = {
     "capture_webcam": _handle_capture_webcam,
     "rescue_file": _handle_rescue_file,
     "remote_download": _handle_remote_download,
+    # Screenshot & Vision
+    "take_screenshot": _handle_take_screenshot,
+    # Browser control
+    "browser": _handle_browser,
+    # GUI automation
+    "gui_action": _handle_gui_action,
+    # Window management
+    "get_windows": _handle_get_windows,
+    "focus_window": _handle_focus_window,
 }
 
 # ---------------------------------------------------------------------------
