@@ -205,6 +205,9 @@ cython_debug/
 # Chroma / RAG local DB (binary, can grow large)
 rag-daemon/chroma_db/
 
+# Host worker runtime logs
+rag-daemon/logs/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
