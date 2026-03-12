@@ -1323,18 +1323,95 @@ def _handle_system_sleep(_payload: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def _send_vk_key(vk: int) -> None:
+    """Press and release a single virtual key via SendInput."""
+    from ctypes import wintypes
+
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
+
+    size = ctypes.sizeof(INPUT)
+    down = INPUT(type=INPUT_KEYBOARD)
+    down.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=0, time=0, dwExtraInfo=None)
+    up = INPUT(type=INPUT_KEYBOARD)
+    up.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(down), size)
+    time.sleep(0.05)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(up), size)
+
+
+def _send_unicode_string(text: str) -> None:
+    """Type a string via SendInput using KEYEVENTF_UNICODE scan-code events.
+
+    Unlike pyautogui.typewrite (which maps chars to virtual-key codes),
+    this injects each character as a Unicode scancode.  The Windows
+    credential-provider (lock-screen PIN field) reliably accepts these.
+    """
+    from ctypes import wintypes
+
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_UNICODE = 0x0004
+    KEYEVENTF_KEYUP = 0x0002
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
+
+    size = ctypes.sizeof(INPUT)
+    for ch in text:
+        code = ord(ch)
+        down = INPUT(type=INPUT_KEYBOARD)
+        down.u.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=None)
+        up = INPUT(type=INPUT_KEYBOARD)
+        up.u.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(down), size)
+        time.sleep(0.05)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(up), size)
+        time.sleep(0.02)
+
+
 def _handle_system_unlock(_payload: dict) -> dict:
     """
     Unlock a locked Windows PC by waking the display and auto-typing the
     stored PIN/password.
 
-    Sequence:
-      1. Wake the display (turn monitors on via SendMessageW SC_MONITORPOWER).
-      2. Brief pause for the lock screen to render.
-      3. Dismiss the "click to unlock" overlay (press Enter).
-      4. Brief pause for the PIN entry field to appear.
-      5. Type the PIN via pyautogui.typewrite().
-      6. Press Enter to submit.
+    The lock-screen credential provider runs on the Winlogon secure desktop,
+    which is isolated from the user's default desktop.  Plain pyautogui
+    calls only reach the default desktop, so keystrokes never arrive at the
+    PIN field.  To fix this the function:
+
+      1. Wakes the display.
+      2. Attaches the current thread to the *input* desktop (Winlogon when
+         locked) via OpenInputDesktop + SetThreadDesktop.
+      3. Sends keyboard events through ctypes SendInput (KEYEVENTF_UNICODE),
+         which the credential provider accepts reliably.
+      4. Restores the original desktop handle afterward.
 
     Requires UNLOCK_PIN to be set in .env.
     Must run in an interactive Windows session (Session 1), not as a service.
@@ -1345,13 +1422,8 @@ def _handle_system_unlock(_payload: dict) -> dict:
     if not UNLOCK_PIN:
         return {"success": False, "error": "UNLOCK_PIN is not set in .env. Cannot unlock."}
 
-    import pyautogui
-
-    # Disable fail-safe: on a locked screen the cursor is often parked in a
-    # corner, which triggers PyAutoGUI's fail-safe.  We restore it after.
-    original_failsafe = pyautogui.FAILSAFE
-    pyautogui.FAILSAFE = False
-
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
     errors: list[str] = []
 
     # 1. Wake the display — send SC_MONITORPOWER with param -1 (on).
@@ -1360,50 +1432,85 @@ def _handle_system_unlock(_payload: dict) -> dict:
         WM_SYSCOMMAND   = 0x0112
         SC_MONITORPOWER = 0xF170
         MONITOR_ON      = -1
-        ctypes.windll.user32.SendMessageW(
+        user32.SendMessageW(
             HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_ON
         )
     except Exception as exc:
         errors.append(f"monitor wake failed: {exc}")
 
-    # Also move the mouse slightly to ensure Windows wakes from idle.
+    # Move the mouse slightly to ensure Windows wakes from idle.
     try:
+        import pyautogui
+        orig_fs = pyautogui.FAILSAFE
+        pyautogui.FAILSAFE = False
         pyautogui.moveRel(1, 0)
         time.sleep(0.1)
         pyautogui.moveRel(-1, 0)
+        pyautogui.FAILSAFE = orig_fs
     except Exception:
         pass
 
     # 2. Wait for lock screen to render.
-    time.sleep(1.5)
+    time.sleep(2.0)
 
-    # 3. Dismiss the "click to sign in" overlay by pressing Enter.
+    # 3. Attach this thread to the current input desktop (Winlogon when
+    #    the workstation is locked) so SendInput reaches the lock screen.
+    DESKTOP_ALL_ACCESS = 0x01FF
+    tid = kernel32.GetCurrentThreadId()
+    old_desktop = user32.GetThreadDesktop(tid)
+    input_desktop = user32.OpenInputDesktop(0, False, DESKTOP_ALL_ACCESS)
+    desktop_switched = False
+
+    if input_desktop:
+        if user32.SetThreadDesktop(input_desktop):
+            desktop_switched = True
+        else:
+            errors.append("SetThreadDesktop failed (continuing anyway)")
+    else:
+        errors.append("OpenInputDesktop returned NULL (continuing anyway)")
+
+    VK_RETURN = 0x0D
+    VK_ESCAPE = 0x1B
+    VK_SPACE  = 0x20
+
+    # 4. Dismiss the lock-screen wallpaper overlay.
+    #    Escape clears any on-screen notification, Space/Enter advances to
+    #    the credential provider.
     try:
-        pyautogui.press("enter")
+        _send_vk_key(VK_ESCAPE)
+        time.sleep(0.3)
+        _send_vk_key(VK_SPACE)
     except Exception as exc:
         errors.append(f"dismiss overlay failed: {exc}")
 
-    # 4. Wait for the PIN entry field to appear.
-    time.sleep(1.5)
+    # 5. Wait for the PIN entry field to appear and receive focus.
+    time.sleep(2.0)
 
-    # 5. Type the PIN. interval=0.05 adds a small delay between keystrokes
-    #    to ensure each one is registered on the lock screen.
+    # 6. Type the PIN using Unicode SendInput events.
     try:
-        pyautogui.typewrite(UNLOCK_PIN, interval=0.05)
+        _send_unicode_string(UNLOCK_PIN)
     except Exception as exc:
         errors.append(f"PIN entry failed: {exc}")
-        pyautogui.FAILSAFE = original_failsafe
+        if desktop_switched and old_desktop:
+            user32.SetThreadDesktop(old_desktop)
+        if input_desktop:
+            user32.CloseDesktop(input_desktop)
         return {"success": False, "error": "; ".join(errors)}
 
-    # 6. Submit.
-    time.sleep(0.2)
+    # 7. Submit.
+    time.sleep(0.3)
     try:
-        pyautogui.press("enter")
+        _send_vk_key(VK_RETURN)
     except Exception as exc:
         errors.append(f"submit failed: {exc}")
 
-    # Restore fail-safe.
-    pyautogui.FAILSAFE = original_failsafe
+    # 8. Give Windows a moment to process sign-in, then restore the
+    #    original desktop handle.
+    time.sleep(1.5)
+    if desktop_switched and old_desktop:
+        user32.SetThreadDesktop(old_desktop)
+    if input_desktop:
+        user32.CloseDesktop(input_desktop)
 
     if errors:
         return {"success": False, "message": "Unlock partially applied.", "errors": errors}
@@ -2187,6 +2294,133 @@ def _handle_run_claude_code_streaming(task: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CLI command streaming handler
+# ---------------------------------------------------------------------------
+
+_CLI_BLOCKLIST = [
+    "format ",       # Windows disk format
+    "mkfs",          # Linux format
+    "rm -rf /",      # Linux nuke
+    "del /f /s /q c:\\",  # Windows nuke
+    ":(){ :|:& };:", # fork bomb
+]
+
+
+def _handle_run_cli_command_streaming(task: dict) -> None:
+    """
+    Run an arbitrary shell command and stream its stdout/stderr to Telegram.
+
+    Output is buffered for _CLAUDE_STREAM_INTERVAL seconds and flushed as
+    Markdown code blocks. Manages its own result routing; dispatch() must
+    return immediately after calling it.
+    """
+    payload:   dict       = task.get("payload", {})
+    sender_id: str | None = task.get("sender_id")
+    bot_token: str        = task.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+    task_id:   str        = task.get("task_id", "?")
+
+    if not sender_id:
+        log.warning("[cli-stream] task has no sender_id — cannot stream output.")
+        return
+
+    def _send(text: str) -> None:
+        _post_worker_callback(text, sender_id, bot_token)
+
+    # 1. Validate command
+    command: str = payload.get("command", "").strip()
+    if not command:
+        _send("❌ run_cli_command: payload.command is required.")
+        return
+
+    cmd_lower = command.lower()
+    for blocked in _CLI_BLOCKLIST:
+        if blocked in cmd_lower:
+            _send(f"❌ Command blocked for safety: `{blocked}`")
+            return
+
+    # 2. Resolve working directory
+    working_dir: str = payload.get("working_dir", "")
+    timeout: int     = int(payload.get("timeout", 7200))  # 2-hour default
+
+    if working_dir:
+        resolved = _require_allowed(working_dir)
+        if resolved is None:
+            _send(f"❌ working_dir not in ALLOWED_WORKSPACES: {working_dir}")
+            return
+    else:
+        resolved = str(Path(ALLOWED_WORKSPACES[0]).resolve()) if ALLOWED_WORKSPACES else None
+
+    log.info("[cli-stream] Starting: cmd=%.120s cwd=%s timeout=%ds", command, resolved, timeout)
+    _send(f"🖥 *CLI started* (task `{task_id}`):\n`{command}`")
+
+    # 3. Launch subprocess
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=resolved,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ},
+        )
+    except Exception as exc:
+        _send(f"❌ Failed to launch command: {exc}")
+        return
+
+    # 4. Stream output with batching
+    deadline: float = time.time() + timeout
+    _CHUNK_LIMIT = 3800
+    state = {"buffer": "", "last_flush": time.time()}
+
+    def _flush_buffer() -> None:
+        content = state["buffer"].rstrip()
+        state["buffer"] = ""
+        state["last_flush"] = time.time()
+        if not content:
+            return
+        for offset in range(0, max(1, len(content)), _CHUNK_LIMIT):
+            piece = content[offset : offset + _CHUNK_LIMIT]
+            _send(f"```\n{piece}\n```")
+
+    try:
+        while True:
+            if time.time() > deadline:
+                log.warning("[cli-stream] Timeout (%ds) exceeded — killing process.", timeout)
+                process.kill()
+                _flush_buffer()
+                _send(f"⏱ *CLI timed out* after {timeout}s and was terminated.")
+                return
+
+            line: str = process.stdout.readline()  # type: ignore[union-attr]
+
+            if line == "" and process.poll() is not None:
+                break
+
+            if line:
+                state["buffer"] += line
+
+            if state["buffer"] and (time.time() - state["last_flush"]) >= _CLAUDE_STREAM_INTERVAL:
+                _flush_buffer()
+
+    except Exception as exc:
+        log.exception("[cli-stream] Error reading subprocess stdout.")
+        state["buffer"] += f"\n[stream read error: {exc}]"
+
+    # 5. Final flush and completion notice
+    _flush_buffer()
+    exit_code: int = process.returncode if process.returncode is not None else -1
+    log.info("[cli-stream] Finished: exit=%d", exit_code)
+
+    if exit_code == 0:
+        _send("✅ *CLI done* (exit 0)")
+    else:
+        _send(f"❌ *CLI failed* (exit {exit_code})")
+
+
+# ---------------------------------------------------------------------------
 # File discovery + Telegram file delivery
 # ---------------------------------------------------------------------------
 
@@ -2869,7 +3103,7 @@ def dispatch(task: dict, r: redis_lib.Redis) -> None:  # type: ignore[type-arg]
     log.info("[task] action=%s task_id=%s", action, task_id)
 
     handler = HANDLERS.get(action)
-    if handler is None:
+    if handler is None and action not in ("run_claude_code", "run_cli_command"):
         result: dict = {"error": f"Unknown action: {action}"}
     elif action == "run_claude_code":
         # Streaming variant: runs in a daemon thread so the main loop can
@@ -2879,6 +3113,15 @@ def dispatch(task: dict, r: redis_lib.Redis) -> None:  # type: ignore[type-arg]
             args=(task,),
             daemon=True,
             name=f"claude-stream-{task_id}",
+        ).start()
+        return
+    elif action == "run_cli_command":
+        # Streaming variant: runs in a daemon thread for arbitrary shell commands.
+        threading.Thread(
+            target=_handle_run_cli_command_streaming,
+            args=(task,),
+            daemon=True,
+            name=f"cli-stream-{task_id}",
         ).start()
         return
     else:

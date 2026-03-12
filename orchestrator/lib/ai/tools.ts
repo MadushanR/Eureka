@@ -1649,6 +1649,33 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    const runCliCommand = tool({
+        description:
+            "Run any shell / command-line instruction on the local machine and stream the output to Telegram. " +
+            "Use when the user says 'run X in cli', 'execute X in terminal', 'run command X', or similar. " +
+            "The command runs until it exits naturally — long-running installs (npm install, pip install, etc.) " +
+            "will keep executing and stream output until they finish. Pass the command exactly as the user specified.",
+        inputSchema: z.object({
+            command: z.string().describe("The shell command to run."),
+            working_dir: z.string().optional().describe("Absolute path to run the command in. Defaults to first ALLOWED_WORKSPACE."),
+            timeout: z.number().optional().describe("Max seconds before force-killing (default 7200 = 2 hours)."),
+        }),
+        async execute({ command, working_dir, timeout }: {
+            command: string;
+            working_dir?: string;
+            timeout?: number;
+        }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set." };
+            await pushHostCommand(
+                "run_cli_command",
+                { command, working_dir, timeout },
+                { senderId, botToken, async: true },
+            );
+            return { success: true, message: "CLI command started — output will stream to Telegram." };
+        },
+    });
+
     const takeScreenshot = tool({
         description: "Capture the user's entire screen and send the photo to Telegram.",
         inputSchema: z.object({
@@ -1791,6 +1818,7 @@ export function makeAiTools(senderId: string) {
         rescue_file: rescueFile,
         remote_download: remoteDownload,
         run_claude_code: runClaudeCode,
+        run_cli_command: runCliCommand,
         take_screenshot: takeScreenshot,
         analyze_screen: analyzeScreen,
         browser_action: browserAction,
