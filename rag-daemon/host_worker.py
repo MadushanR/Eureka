@@ -1282,37 +1282,42 @@ def _handle_system_lock(_payload: dict) -> dict:
 
 
 def _handle_system_shutdown(_payload: dict) -> dict:
+    # Use Popen (non-blocking) so the result is published to Redis before the
+    # system goes offline.  shutdown /t 5 gives a 5-second grace period.
     try:
         if platform.system() == "Windows":
-            subprocess.run(["shutdown", "/s", "/t", "5"], capture_output=True)
+            subprocess.Popen(["shutdown", "/s", "/t", "5"])
         else:
-            subprocess.run(["shutdown", "-h", "now"], capture_output=True)
+            subprocess.Popen(["shutdown", "-h", "now"])
         return {"success": True, "message": "Shutdown initiated."}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _handle_system_restart(_payload: dict) -> dict:
+    # Non-blocking so the result is published before the system restarts.
     try:
         if platform.system() == "Windows":
-            subprocess.run(["shutdown", "/r", "/t", "5"], capture_output=True)
+            subprocess.Popen(["shutdown", "/r", "/t", "5"])
         else:
-            subprocess.run(["shutdown", "-r", "now"], capture_output=True)
+            subprocess.Popen(["shutdown", "-r", "now"])
         return {"success": True, "message": "Restart initiated."}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _handle_system_sleep(_payload: dict) -> dict:
+    # Non-blocking: Popen lets the result be published to Redis before the PC
+    # suspends.  Without this, subprocess.run blocks until wake, the response
+    # never reaches Next.js, and the orchestrator times out with a worker error.
     try:
         if platform.system() == "Windows":
-            subprocess.run(
-                ["powershell", "-Command",
-                 "Add-Type -Assembly System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"],
-                capture_output=True,
+            subprocess.Popen(
+                ["powershell", "-NonInteractive", "-NoProfile", "-Command",
+                 "Add-Type -Assembly System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"]
             )
         else:
-            subprocess.run(["systemctl", "suspend"], capture_output=True)
+            subprocess.Popen(["systemctl", "suspend"])
         return {"success": True, "message": "Sleep initiated."}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1817,6 +1822,99 @@ def _handle_adjust_brightness(payload: dict) -> dict:
         "success": any_ok,
         "message": "\n".join(results),
     }
+
+
+# ---------------------------------------------------------------------------
+# Browser / media player media-key control
+# ---------------------------------------------------------------------------
+
+_MEDIA_KEY_MAP: dict[str, str] = {
+    "play_pause": "playpause",
+    "next":       "nexttrack",
+    "previous":   "prevtrack",
+    "stop":       "stop",
+}
+
+
+def _show_toast_notification(title: str, body: str) -> None:
+    """Show a Windows toast notification (non-blocking, via PowerShell WinRT)."""
+    if platform.system() != "Windows":
+        return
+    safe_title = title.replace("'", "\\'").replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
+    safe_body = body.replace("'", "\\'").replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
+    ps = (
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]|Out-Null;"
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]|Out-Null;"
+        "$xml=New-Object Windows.Data.Xml.Dom.XmlDocument;"
+        f"$xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{safe_title}</text>"
+        f"<text>{safe_body}</text></binding></visual></toast>');"
+        "$toast=[Windows.UI.Notifications.ToastNotification]::new($xml);"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Eureka').Show($toast)"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell", "-WindowStyle", "Hidden", "-NonInteractive", "-NoProfile", "-Command", ps]
+        )
+    except Exception as exc:
+        log.warning("[reminder] Toast notification failed: %s", exc)
+
+
+def _reminder_worker(message: str, delay_seconds: int, sender_id: str, bot_token: str) -> None:
+    """Daemon thread: sleep then fire toast + Telegram notification."""
+    log.info("[reminder] Sleeping %ds for reminder: %s", delay_seconds, message[:60])
+    time.sleep(delay_seconds)
+    log.info("[reminder] Firing reminder: %s", message[:60])
+    _show_toast_notification("Eureka Reminder", message)
+    _tg(sender_id, f"\u23f0 Reminder: {message}", bot_token)
+
+
+def _handle_set_reminder(payload: dict) -> dict:
+    """Schedule a reminder that fires after delay_seconds."""
+    message: str = payload.get("message", "").strip()
+    delay_seconds: int = int(payload.get("delay_seconds", 0))
+    sender_id: str = str(payload.get("sender_id", ""))
+    bot_token: str = payload.get("bot_token") or BOT_TOKEN
+    if not message:
+        return {"success": False, "error": "message is required."}
+    if delay_seconds < 0:
+        return {"success": False, "error": "delay_seconds must be >= 0."}
+    if not sender_id:
+        return {"success": False, "error": "sender_id is required."}
+    threading.Thread(
+        target=_reminder_worker,
+        args=(message, delay_seconds, sender_id, bot_token),
+        daemon=True,
+        name=f"reminder-{sender_id}",
+    ).start()
+    if delay_seconds < 60:
+        when = f"in {delay_seconds}s"
+    elif delay_seconds < 3600:
+        when = f"in {delay_seconds // 60}m"
+    else:
+        when = f"in {delay_seconds // 3600}h {(delay_seconds % 3600) // 60}m"
+    return {"success": True, "message": f"Reminder set \u2014 will fire {when}."}
+
+
+def _handle_browser_media(payload: dict) -> dict:
+    """
+    Send an OS-level media key to control playback in any browser tab or
+    media player (YouTube, Spotify Web, Netflix, Windows Media Player, etc.).
+    Requires pyautogui (already a project dependency).
+    """
+    action: str = payload.get("action", "").strip()
+    key: str | None = _MEDIA_KEY_MAP.get(action)
+    if not key:
+        valid = ", ".join(_MEDIA_KEY_MAP)
+        return {"success": False, "error": f"Unknown action '{action}'. Valid actions: {valid}."}
+    try:
+        import pyautogui  # noqa: PLC0415
+        pyautogui.press(key)
+        return {"success": True, "message": f"Sent media key: {key}"}
+    except ImportError:
+        return {"success": False, "error": "pyautogui is not installed. Run: pip install pyautogui"}
+    except Exception as exc:
+        return {"success": False, "error": f"Media key failed: {exc}"}
+
 
 
 # --- Claude Code -------------------------------------------------------------
@@ -2732,9 +2830,12 @@ HANDLERS: dict[str, Any] = {
     # Task manager
     "list_apps": _handle_list_apps,
     "kill_app": _handle_kill_app,
+    # Reminders
+    "set_reminder": _handle_set_reminder,
     # Media & display
     "adjust_volume": _handle_adjust_volume,
     "adjust_brightness": _handle_adjust_brightness,
+    "browser_media": _handle_browser_media,
     # Claude Code
     "run_claude_code": _handle_run_claude_code,
     # Remote Sentinel

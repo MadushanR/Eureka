@@ -405,6 +405,21 @@ export async function getPendingPushOnly(pushOnlyId: string): Promise<StagedPush
     }
 }
 
+export async function deleteStagedPatch(patchId: string): Promise<void> {
+    try { await getRedisClient().del(patchKey(patchId)); }
+    catch (error) { console.error(`[redis] deleteStagedPatch failed for patchId="${patchId}":`, error instanceof Error ? error.message : error); }
+}
+
+export async function deleteStagedPush(pushId: string): Promise<void> {
+    try { await getRedisClient().del(pushKey(pushId)); }
+    catch (error) { console.error(`[redis] deleteStagedPush failed for pushId="${pushId}":`, error instanceof Error ? error.message : error); }
+}
+
+export async function deleteStagedPushOnly(pushOnlyId: string): Promise<void> {
+    try { await getRedisClient().del(pushOnlyKey(pushOnlyId)); }
+    catch (error) { console.error(`[redis] deleteStagedPushOnly failed for pushOnlyId="${pushOnlyId}":`, error instanceof Error ? error.message : error); }
+}
+
 // ---------------------------------------------------------------------------
 // Job manager (dev-agent job tracking)
 // ---------------------------------------------------------------------------

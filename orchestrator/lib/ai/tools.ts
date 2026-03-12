@@ -652,7 +652,10 @@ export const deleteCode = tool({
             const preview = (data.deleted_lines ?? "").slice(0, 500);
             return {
                 text: `I found the block to delete:\n\n\`\`\`\n${preview}\n\`\`\`\n\nPress **Approve & Apply** to remove it.`,
-                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+                interactiveButtons: [
+                    { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+                    { action: `reject_patch:${patchId}`, label: "Reject" },
+                ],
             };
         } catch (e) {
             return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
@@ -726,7 +729,10 @@ export const insertCode = tool({
             const patchId = await stagePatch(patch, workspace);
             return {
                 text: "I've prepared new code to add. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
-                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+                interactiveButtons: [
+                    { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+                    { action: `reject_patch:${patchId}`, label: "Reject" },
+                ],
             };
         } catch (e) {
             return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
@@ -800,7 +806,10 @@ export const editFile = tool({
             const patchId = await stagePatch(patch, workspace);
             return {
                 text: "I've prepared a code change. Review and press **Approve & Apply** to apply it.\n\n```\n" + patch.slice(0, 1500) + "\n```",
-                interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+                interactiveButtons: [
+                    { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+                    { action: `reject_patch:${patchId}`, label: "Reject" },
+                ],
             };
         } catch (e) {
             return { text: `Worker error: ${e instanceof Error ? e.message : String(e)}` };
@@ -846,10 +855,8 @@ export const requestPatchApproval = tool({
         const patchId = await stagePatch(patch_string, workspace_path);
 
         const buttons: ReadonlyArray<InteractiveButton> = [
-            {
-                action: `apply_patch:${patchId}`,
-                label: "Approve & Apply",
-            },
+            { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+            { action: `reject_patch:${patchId}`, label: "Reject" },
         ];
 
         return {
@@ -928,7 +935,10 @@ export const removeLine = tool({
         const patchId = await stagePatch(patch, resolvedPath);
         return {
             text: `I have prepared a patch to remove line ${line_number}${line_end != null ? `–${line_end}` : ""} from \`${file_path}\`. Do you want to apply it?`,
-            interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+            interactiveButtons: [
+                    { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+                    { action: `reject_patch:${patchId}`, label: "Reject" },
+                ],
         };
     },
 });
@@ -1011,7 +1021,10 @@ export const removeLinesMatching = tool({
         const scope = file_path ? ` in \`${file_path}\`` : ` across ${filesAffected} file(s)`;
         return {
             text: `I have prepared a patch to remove all lines containing "${pattern}"${scope}. Do you want to apply it?`,
-            interactiveButtons: [{ action: `apply_patch:${patchId}`, label: "Approve & Apply" }],
+            interactiveButtons: [
+                    { action: `apply_patch:${patchId}`, label: "Approve & Apply" },
+                    { action: `reject_patch:${patchId}`, label: "Reject" },
+                ],
         };
     },
 });
@@ -1096,6 +1109,7 @@ export const preparePushApproval = tool({
                 "\n```\n\nApprove to add all changes, commit, and push?",
             interactiveButtons: [
                 { action: `push:${pushId}`, label: "Approve & Push" },
+                { action: `reject_push:${pushId}`, label: "Reject" },
             ],
         };
     },
@@ -1129,6 +1143,7 @@ export const preparePushOnlyApproval = tool({
                 `\`${workspace_path}\`.\n\nApprove to push the current branch?`,
             interactiveButtons: [
                 { action: `push_only:${pushOnlyId}`, label: "Approve & Push" },
+                { action: `reject_push_only:${pushOnlyId}`, label: "Reject" },
             ],
         };
     },
@@ -1246,6 +1261,27 @@ export const systemBrightness = tool({
     }),
     async execute({ absolute_level, step }: { absolute_level?: number; step?: string }): Promise<unknown> {
         return workerCall("adjust_brightness", { absolute_level, step });
+    },
+});
+
+// ---------------------------------------------------------------------------
+// Browser / media player media-key control
+// ---------------------------------------------------------------------------
+
+export const browserMediaControl = tool({
+    description:
+        "Send an OS-level media key to control media playing in any browser (YouTube, Spotify Web, Netflix, etc.) " +
+        "or media player. Use when the user says 'pause the video', 'play', 'skip to next', 'previous track', 'stop media', etc. " +
+        "Does NOT require Spotify — works with any browser tab or media player that responds to system media keys.",
+    inputSchema: z.object({
+        action: z
+            .enum(["play_pause", "next", "previous", "stop"])
+            .describe(
+                "play_pause: toggle play/pause | next: skip to next track/video | previous: go to previous | stop: stop playback"
+            ),
+    }),
+    async execute({ action }: { action: "play_pause" | "next" | "previous" | "stop" }): Promise<unknown> {
+        return workerCall("browser_media", { action });
     },
 });
 
@@ -1408,6 +1444,7 @@ const baseAiTools = {
     spotify_volume: spotifyVolume,
     spotify_status: spotifyStatus,
     spotify_close: spotifyClose,
+    browser_media_control: browserMediaControl,
     system_volume: systemVolume,
     system_brightness: systemBrightness,
     system_shutdown: systemShutdown,
@@ -1524,6 +1561,22 @@ export function makeAiTools(senderId: string) {
             } catch (e) {
                 return { error: e instanceof Error ? e.message : "Worker error starting download." };
             }
+        },
+    });
+
+    const setReminder = tool({
+        description:
+            "Schedule a reminder: shows a Windows toast notification and sends a Telegram message after a delay. " +
+            "Use when the user says things like 'remind me to X in 30 minutes', 'remind me at 9pm', 'set a reminder for...', etc. " +
+            "Compute delay_seconds from the user's requested time and the current time. Returns immediately.",
+        inputSchema: z.object({
+            message: z.string().min(1).describe("The reminder text to show (e.g. 'Open the bookmarked article')."),
+            delay_seconds: z.number().int().min(0).describe("How many seconds from now to fire the reminder."),
+        }),
+        async execute({ message, delay_seconds }: { message: string; delay_seconds: number }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set." };
+            return workerCall("set_reminder", { message, delay_seconds, sender_id: senderId, bot_token: botToken });
         },
     });
 
@@ -1743,6 +1796,7 @@ export function makeAiTools(senderId: string) {
         browser_action: browserAction,
         gui_action: guiAction,
         manage_windows: manageWindows,
+        set_reminder: setReminder,
     };
 }
 

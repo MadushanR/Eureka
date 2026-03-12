@@ -48,6 +48,9 @@ import {
     getPendingPatch,
     getPendingPush,
     getPendingPushOnly,
+    deleteStagedPatch,
+    deleteStagedPush,
+    deleteStagedPushOnly,
     getActiveJob,
     updateJob,
     clearActiveJob,
@@ -377,6 +380,42 @@ async function handlePushOnlyAction(message: StandardMessage): Promise<boolean> 
     return true;
 }
 
+async function handleRejectPatchAction(message: StandardMessage): Promise<boolean> {
+    const prefix = "reject_patch:";
+    if (!message.isAction || !message.text.startsWith(prefix)) return false;
+    const patchId = message.text.slice(prefix.length).trim();
+    if (!patchId) return false;
+    const adapter = getAdapter();
+    if (message.callbackQueryId) await adapter.answerCallbackQuery(message.callbackQueryId);
+    await deleteStagedPatch(patchId);
+    await adapter.sendResponse({ text: "Patch rejected and discarded." }, message.senderId);
+    return true;
+}
+
+async function handleRejectPushAction(message: StandardMessage): Promise<boolean> {
+    const prefix = "reject_push:";
+    if (!message.isAction || !message.text.startsWith(prefix)) return false;
+    const pushId = message.text.slice(prefix.length).trim();
+    if (!pushId) return false;
+    const adapter = getAdapter();
+    if (message.callbackQueryId) await adapter.answerCallbackQuery(message.callbackQueryId);
+    await deleteStagedPush(pushId);
+    await adapter.sendResponse({ text: "Push rejected and discarded." }, message.senderId);
+    return true;
+}
+
+async function handleRejectPushOnlyAction(message: StandardMessage): Promise<boolean> {
+    const prefix = "reject_push_only:";
+    if (!message.isAction || !message.text.startsWith(prefix)) return false;
+    const pushOnlyId = message.text.slice(prefix.length).trim();
+    if (!pushOnlyId) return false;
+    const adapter = getAdapter();
+    if (message.callbackQueryId) await adapter.answerCallbackQuery(message.callbackQueryId);
+    await deleteStagedPushOnly(pushOnlyId);
+    await adapter.sendResponse({ text: "Push rejected and discarded." }, message.senderId);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Background dev agent runner (fully isolated from normal message flow)
 // ---------------------------------------------------------------------------
@@ -658,6 +697,20 @@ async function processMessage(message: StandardMessage): Promise<void> {
         // Handle "Approve & Push" button: commit and push via daemon, then done.
         if (await handlePushAction(message)) {
             console.info(`[telegram/webhook] Push action handled for sender=${message.senderId}.`);
+            return;
+        }
+
+        // Handle "Reject" buttons for staged patches and pushes.
+        if (await handleRejectPatchAction(message)) {
+            console.info(`[telegram/webhook] Reject-patch action handled for sender=${message.senderId}.`);
+            return;
+        }
+        if (await handleRejectPushAction(message)) {
+            console.info(`[telegram/webhook] Reject-push action handled for sender=${message.senderId}.`);
+            return;
+        }
+        if (await handleRejectPushOnlyAction(message)) {
+            console.info(`[telegram/webhook] Reject-push-only action handled for sender=${message.senderId}.`);
             return;
         }
 
