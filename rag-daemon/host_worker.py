@@ -582,6 +582,20 @@ def _handle_create_files(payload: dict) -> dict:
     return {"success": failed == 0, "created": created, "failed": failed, "results": results}
 
 
+def _handle_create_folder(payload: dict) -> dict:
+    path: str = payload.get("path", "")
+    if not path:
+        return {"success": False, "error": "path is required"}
+    resolved = _require_allowed(path)
+    if resolved is None:
+        return {"success": False, "error": f"Path not in ALLOWED_WORKSPACES: {path}"}
+    try:
+        Path(resolved).mkdir(parents=True, exist_ok=True)
+        return {"success": True, "message": f"Created folder: {resolved}", "path": resolved}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def _handle_delete_path(payload: dict) -> dict:
     path: str = payload.get("path", "")
 
@@ -1323,77 +1337,125 @@ def _handle_system_sleep(_payload: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def _send_vk_key(vk: int) -> None:
-    """Press and release a single virtual key via SendInput."""
-    from ctypes import wintypes
+def _build_unlock_subprocess_script() -> str:
+    """Return a self-contained Python script that types a PIN on the
+    Windows lock screen.  Designed to be spawned with
+    ``STARTUPINFO.lpDesktop = "WinSta0\\Winlogon"`` so the process
+    starts on the secure desktop.  The PIN is passed via the
+    ``_EUREKA_PIN`` environment variable.  Diagnostics are printed to
+    stdout as a single JSON line."""
 
-    INPUT_KEYBOARD = 1
-    KEYEVENTF_KEYUP = 0x0002
+    # Triple-quoted raw string — no f-string interpolation; PIN comes from env.
+    return r'''
+import ctypes, json, os, sys, time
+from ctypes import wintypes
 
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
+user32  = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+diag: dict = {}
 
-    class INPUTUNION(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT)]
+pin = os.environ.get("_EUREKA_PIN", "")
+if not pin:
+    print(json.dumps({"success": False, "error": "no PIN in env"}))
+    sys.exit(1)
 
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
+# ---- Try attaching to the active input desktop (belt-and-suspenders) ----
+DESKTOP_ALL_ACCESS = 0x01FF
+UOI_NAME = 2
 
-    size = ctypes.sizeof(INPUT)
-    down = INPUT(type=INPUT_KEYBOARD)
-    down.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=0, time=0, dwExtraInfo=None)
-    up = INPUT(type=INPUT_KEYBOARD)
-    up.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
-    ctypes.windll.user32.SendInput(1, ctypes.byref(down), size)
+hDesk = user32.OpenInputDesktop(0, False, DESKTOP_ALL_ACCESS)
+diag["open_input_desktop"] = bool(hDesk)
+
+if hDesk:
+    buf = ctypes.create_unicode_buffer(256)
+    needed = wintypes.DWORD(0)
+    user32.GetUserObjectInformationW(
+        hDesk, UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed)
+    )
+    diag["input_desktop_name"] = buf.value
+
+    ok = user32.SetThreadDesktop(hDesk)
+    diag["set_thread_desktop"] = bool(ok)
+    if not ok:
+        diag["set_thread_desktop_err"] = kernel32.GetLastError()
+
+# ---- SendInput structures ----
+INPUT_KEYBOARD  = 1
+KEYEVENTF_KEYUP = 0x0002
+MAPVK_VK_TO_VSC = 0
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         wintypes.WORD),
+        ("wScan",       wintypes.WORD),
+        ("dwFlags",     wintypes.DWORD),
+        ("time",        wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class _IU(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _IU)]
+
+SZ = ctypes.sizeof(INPUT)
+
+def press_vk(vk: int) -> tuple[int, int]:
+    sc = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+    d = INPUT(type=INPUT_KEYBOARD)
+    d.u.ki = KEYBDINPUT(wVk=vk, wScan=sc, dwFlags=0, time=0, dwExtraInfo=None)
+    u = INPUT(type=INPUT_KEYBOARD)
+    u.u.ki = KEYBDINPUT(wVk=vk, wScan=sc, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
+    r1 = user32.SendInput(1, ctypes.byref(d), SZ)
     time.sleep(0.05)
-    ctypes.windll.user32.SendInput(1, ctypes.byref(up), size)
+    r2 = user32.SendInput(1, ctypes.byref(u), SZ)
+    return (r1, r2)
 
+def char_to_vk(ch: str) -> int:
+    if "0" <= ch <= "9":
+        return ord(ch)           # VK_0..VK_9 == 0x30..0x39
+    if "a" <= ch <= "z":
+        return ord(ch.upper())   # VK_A..VK_Z == 0x41..0x5A
+    if "A" <= ch <= "Z":
+        return ord(ch)
+    r = user32.VkKeyScanW(ord(ch))
+    return r & 0xFF
 
-def _send_unicode_string(text: str) -> None:
-    """Type a string via SendInput using KEYEVENTF_UNICODE scan-code events.
+VK_RETURN  = 0x0D
+VK_ESCAPE  = 0x1B
+VK_SPACE   = 0x20
 
-    Unlike pyautogui.typewrite (which maps chars to virtual-key codes),
-    this injects each character as a Unicode scancode.  The Windows
-    credential-provider (lock-screen PIN field) reliably accepts these.
-    """
-    from ctypes import wintypes
+# ---- Step 1: dismiss lock-screen wallpaper overlay ----
+press_vk(VK_ESCAPE)
+time.sleep(0.3)
+press_vk(VK_SPACE)
+time.sleep(2.5)
 
-    INPUT_KEYBOARD = 1
-    KEYEVENTF_UNICODE = 0x0004
-    KEYEVENTF_KEYUP = 0x0002
+# ---- Step 2: type the PIN ----
+si_ok = 0
+si_fail = 0
+for ch in pin:
+    vk = char_to_vk(ch)
+    r1, r2 = press_vk(vk)
+    if r1 == 1 and r2 == 1:
+        si_ok += 1
+    else:
+        si_fail += 1
+    time.sleep(0.06)
 
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
+diag["keystrokes_ok"] = si_ok
+diag["keystrokes_fail"] = si_fail
 
-    class INPUTUNION(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT)]
+# ---- Step 3: submit ----
+time.sleep(0.3)
+press_vk(VK_RETURN)
 
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
+if hDesk:
+    user32.CloseDesktop(hDesk)
 
-    size = ctypes.sizeof(INPUT)
-    for ch in text:
-        code = ord(ch)
-        down = INPUT(type=INPUT_KEYBOARD)
-        down.u.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=None)
-        up = INPUT(type=INPUT_KEYBOARD)
-        up.u.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
-        ctypes.windll.user32.SendInput(1, ctypes.byref(down), size)
-        time.sleep(0.05)
-        ctypes.windll.user32.SendInput(1, ctypes.byref(up), size)
-        time.sleep(0.02)
+print(json.dumps({"success": si_fail == 0, "diag": diag}))
+'''
 
 
 def _handle_system_unlock(_payload: dict) -> dict:
@@ -1402,19 +1464,22 @@ def _handle_system_unlock(_payload: dict) -> dict:
     stored PIN/password.
 
     The lock-screen credential provider runs on the Winlogon secure desktop,
-    which is isolated from the user's default desktop.  Plain pyautogui
-    calls only reach the default desktop, so keystrokes never arrive at the
-    PIN field.  To fix this the function:
+    which is isolated from the user's default desktop.  ``SendInput`` calls
+    from a thread on the default desktop are silently dropped.
 
-      1. Wakes the display.
-      2. Attaches the current thread to the *input* desktop (Winlogon when
-         locked) via OpenInputDesktop + SetThreadDesktop.
-      3. Sends keyboard events through ctypes SendInput (KEYEVENTF_UNICODE),
-         which the credential provider accepts reliably.
-      4. Restores the original desktop handle afterward.
+    Strategy:
+      1. Wake the display via ``SC_MONITORPOWER`` + mouse jiggle.
+      2. Spawn a **dedicated subprocess** whose ``STARTUPINFO.lpDesktop``
+         is set to ``WinSta0\\Winlogon``, so it starts life on the secure
+         desktop.  Inside, it also calls ``OpenInputDesktop`` +
+         ``SetThreadDesktop`` as a fallback.
+      3. The subprocess types the PIN with ``SendInput`` using VK codes +
+         hardware scan codes (the same events a physical keyboard produces)
+         and reports diagnostics to stdout as JSON.
 
-    Requires UNLOCK_PIN to be set in .env.
-    Must run in an interactive Windows session (Session 1), not as a service.
+    Requires ``UNLOCK_PIN`` in ``.env``.
+    The host-worker should be **Run as Administrator** so it can access the
+    Winlogon desktop.
     """
     if platform.system() != "Windows":
         return {"success": False, "error": "system_unlock is Windows-only."}
@@ -1423,22 +1488,14 @@ def _handle_system_unlock(_payload: dict) -> dict:
         return {"success": False, "error": "UNLOCK_PIN is not set in .env. Cannot unlock."}
 
     user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
     errors: list[str] = []
 
-    # 1. Wake the display — send SC_MONITORPOWER with param -1 (on).
+    # 1. Wake the display.
     try:
-        HWND_BROADCAST  = 0xFFFF
-        WM_SYSCOMMAND   = 0x0112
-        SC_MONITORPOWER = 0xF170
-        MONITOR_ON      = -1
-        user32.SendMessageW(
-            HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_ON
-        )
+        user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1)  # SC_MONITORPOWER → ON
     except Exception as exc:
-        errors.append(f"monitor wake failed: {exc}")
+        errors.append(f"monitor wake: {exc}")
 
-    # Move the mouse slightly to ensure Windows wakes from idle.
     try:
         import pyautogui
         orig_fs = pyautogui.FAILSAFE
@@ -1450,71 +1507,63 @@ def _handle_system_unlock(_payload: dict) -> dict:
     except Exception:
         pass
 
-    # 2. Wait for lock screen to render.
     time.sleep(2.0)
 
-    # 3. Attach this thread to the current input desktop (Winlogon when
-    #    the workstation is locked) so SendInput reaches the lock screen.
-    DESKTOP_ALL_ACCESS = 0x01FF
-    tid = kernel32.GetCurrentThreadId()
-    old_desktop = user32.GetThreadDesktop(tid)
-    input_desktop = user32.OpenInputDesktop(0, False, DESKTOP_ALL_ACCESS)
-    desktop_switched = False
-
-    if input_desktop:
-        if user32.SetThreadDesktop(input_desktop):
-            desktop_switched = True
-        else:
-            errors.append("SetThreadDesktop failed (continuing anyway)")
-    else:
-        errors.append("OpenInputDesktop returned NULL (continuing anyway)")
-
-    VK_RETURN = 0x0D
-    VK_ESCAPE = 0x1B
-    VK_SPACE  = 0x20
-
-    # 4. Dismiss the lock-screen wallpaper overlay.
-    #    Escape clears any on-screen notification, Space/Enter advances to
-    #    the credential provider.
+    # 2. Write self-contained unlock script and spawn it on the Winlogon desktop.
+    import tempfile
+    script = _build_unlock_subprocess_script()
+    script_path = os.path.join(tempfile.gettempdir(), "_eureka_unlock.pyw")
     try:
-        _send_vk_key(VK_ESCAPE)
-        time.sleep(0.3)
-        _send_vk_key(VK_SPACE)
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write(script)
     except Exception as exc:
-        errors.append(f"dismiss overlay failed: {exc}")
+        return {"success": False, "error": f"failed to write unlock script: {exc}"}
 
-    # 5. Wait for the PIN entry field to appear and receive focus.
-    time.sleep(2.0)
-
-    # 6. Type the PIN using Unicode SendInput events.
+    diag: dict = {}
     try:
-        _send_unicode_string(UNLOCK_PIN)
+        si = subprocess.STARTUPINFO()
+        si.lpDesktop = "WinSta0\\Winlogon"
+
+        env = os.environ.copy()
+        env["_EUREKA_PIN"] = UNLOCK_PIN
+
+        proc = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, text=True, timeout=20,
+            startupinfo=si, env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        if proc.stdout.strip():
+            for line in reversed(proc.stdout.strip().splitlines()):
+                try:
+                    diag = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if proc.returncode != 0:
+            errors.append(f"subprocess exit code {proc.returncode}")
+        if proc.stderr.strip():
+            diag["stderr"] = proc.stderr.strip()[-500:]
+    except subprocess.TimeoutExpired:
+        errors.append("unlock subprocess timed out (20 s)")
     except Exception as exc:
-        errors.append(f"PIN entry failed: {exc}")
-        if desktop_switched and old_desktop:
-            user32.SetThreadDesktop(old_desktop)
-        if input_desktop:
-            user32.CloseDesktop(input_desktop)
-        return {"success": False, "error": "; ".join(errors)}
+        errors.append(f"subprocess error: {exc}")
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
 
-    # 7. Submit.
-    time.sleep(0.3)
-    try:
-        _send_vk_key(VK_RETURN)
-    except Exception as exc:
-        errors.append(f"submit failed: {exc}")
-
-    # 8. Give Windows a moment to process sign-in, then restore the
-    #    original desktop handle.
-    time.sleep(1.5)
-    if desktop_switched and old_desktop:
-        user32.SetThreadDesktop(old_desktop)
-    if input_desktop:
-        user32.CloseDesktop(input_desktop)
-
-    if errors:
-        return {"success": False, "message": "Unlock partially applied.", "errors": errors}
-    return {"success": True, "message": "PC unlocked."}
+    sub_ok = diag.get("success", False)
+    if errors or not sub_ok:
+        return {
+            "success": False,
+            "message": "Unlock attempt completed with issues — check diagnostics.",
+            "errors": errors,
+            "diagnostics": diag,
+        }
+    return {"success": True, "message": "PC unlocked.", "diagnostics": diag}
 
 
 def _handle_lockdown_pc(_payload: dict) -> dict:
@@ -3029,6 +3078,7 @@ HANDLERS: dict[str, Any] = {
     "read_file": _handle_read_file,
     "create_file": _handle_create_file,
     "create_files": _handle_create_files,
+    "create_folder": _handle_create_folder,
     "delete_path": _handle_delete_path,
     # Commands
     "run_command": _handle_run_command,

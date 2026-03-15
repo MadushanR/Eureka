@@ -503,6 +503,30 @@ export const batchCreateFiles = tool({
 });
 
 /**
+ * Tool: create_folder
+ * -------------------
+ * Create a new empty directory (and any missing parent directories) on the user's PC.
+ */
+export const createFolder = tool({
+    description:
+        "Create a new folder (directory) at the given absolute path on the user's PC. " +
+        "Creates all intermediate parent directories as needed. Use this when the user asks to create a folder or directory.",
+    inputSchema: z.object({
+        path: z
+            .string()
+            .min(1)
+            .describe("Absolute path of the folder to create (must be within an allowed workspace, e.g. 'C:/Users/madus/Desktop/MyProject')."),
+    }),
+    async execute({ path }: { path: string }): Promise<unknown> {
+        try {
+            return await callWorker("create_folder", { path: path.trim() });
+        } catch (e) {
+            return { success: false, error: e instanceof Error ? e.message : "Worker error creating folder." };
+        }
+    },
+});
+
+/**
  * Tool: github_create_repo
  * ------------------------
  * Create a new GitHub repository via the REST API.
@@ -1418,6 +1442,7 @@ export const findFile = tool({
 const baseAiTools = {
     search_local_codebase: searchLocalCodebase,
     create_file: createFile,
+    create_folder: createFolder,
     batch_create_files: batchCreateFiles,
     github_create_repo: githubCreateRepo,
     git_clone: gitClone,
