@@ -1589,19 +1589,72 @@ export function makeAiTools(senderId: string) {
         },
     });
 
+    const fetchAndDownload = tool({
+        description:
+            "Download any URL that leads to a file. Works two ways: " +
+            "(1) Direct file URL (ends in .exe, .zip, .msi, .pdf, .iso, etc.) — downloads it immediately on the home PC. " +
+            "(2) Software/download page URL — scrapes the page to find a downloadable file link, then downloads it. " +
+            "Use this when the user shares any URL and wants the file downloaded on the home PC. " +
+            "Sends the found link and notifies via Telegram when the download completes.",
+        inputSchema: z.object({
+            url: z.string().min(1).describe("The direct file URL or download page URL."),
+            hint: z.string().optional().describe("Optional keyword to narrow link selection from a page (e.g. 'windows', 'linux', 'installer', 'setup')."),
+        }),
+        async execute({ url, hint }: { url: string; hint?: string }): Promise<unknown> {
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set in environment." };
+            try {
+                return await callWorker("fetch_and_download", {
+                    url,
+                    hint: hint ?? "",
+                    chat_id: senderId,
+                    bot_token: botToken,
+                }, 30_000);
+            } catch (e) {
+                return { error: e instanceof Error ? e.message : "Worker error during scrape-and-download." };
+            }
+        },
+    });
+
     const setReminder = tool({
         description:
-            "Schedule a reminder: shows a Windows toast notification and sends a Telegram message after a delay. " +
+            "Schedule a reminder: shows a Windows toast notification and sends a Telegram message. " +
             "Use when the user says things like 'remind me to X in 30 minutes', 'remind me at 9pm', 'set a reminder for...', etc. " +
-            "Compute delay_seconds from the user's requested time and the current time. Returns immediately.",
+            "For RELATIVE times ('in 30 minutes'), set delay_seconds to the number of seconds. " +
+            "For ABSOLUTE times ('at 9:30pm'), set target_time to 'HH:MM' in 24-hour format (e.g. '21:30') — delay is computed automatically.",
         inputSchema: z.object({
             message: z.string().min(1).describe("The reminder text to show (e.g. 'Open the bookmarked article')."),
-            delay_seconds: z.number().int().min(0).describe("How many seconds from now to fire the reminder."),
+            delay_seconds: z.number().int().min(0).describe("Seconds from now to fire. Set to 0 when using target_time.").default(0),
+            target_time: z.string().optional().describe("Target time in 'HH:MM' 24-hour format, e.g. '21:30' for 9:30 PM. When provided, delay is computed server-side."),
         }),
-        async execute({ message, delay_seconds }: { message: string; delay_seconds: number }): Promise<unknown> {
+        async execute({ message, delay_seconds, target_time }: { message: string; delay_seconds: number; target_time?: string }): Promise<unknown> {
             const botToken = process.env.TELEGRAM_BOT_TOKEN;
             if (!botToken) return { error: "TELEGRAM_BOT_TOKEN not set." };
-            return workerCall("set_reminder", { message, delay_seconds, sender_id: senderId, bot_token: botToken });
+
+            let actualDelay = delay_seconds;
+            if (target_time) {
+                const m = target_time.match(/^(\d{1,2}):(\d{2})$/);
+                if (m) {
+                    const tz = process.env.USER_TIMEZONE || "Asia/Kolkata";
+                    const fmt = new Intl.DateTimeFormat("en-GB", {
+                        timeZone: tz,
+                        hour: "numeric", minute: "numeric", second: "numeric",
+                        hour12: false,
+                    });
+                    const parts = fmt.formatToParts(new Date());
+                    const nowH = parseInt(parts.find(p => p.type === "hour")!.value, 10);
+                    const nowM = parseInt(parts.find(p => p.type === "minute")!.value, 10);
+                    const nowS = parseInt(parts.find(p => p.type === "second")!.value, 10);
+
+                    const targetSec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
+                    const nowSec = nowH * 3600 + nowM * 60 + nowS;
+                    actualDelay = targetSec - nowSec;
+                    if (actualDelay <= 0) actualDelay += 86400; // next day
+                }
+            }
+
+            if (actualDelay <= 0) return { error: "Could not compute a valid delay." };
+            return workerCall("set_reminder", { message, delay_seconds: actualDelay, sender_id: senderId, bot_token: botToken });
         },
     });
 
@@ -1842,6 +1895,7 @@ export function makeAiTools(senderId: string) {
         capture_webcam: captureWebcam,
         rescue_file: rescueFile,
         remote_download: remoteDownload,
+        fetch_and_download: fetchAndDownload,
         run_claude_code: runClaudeCode,
         run_cli_command: runCliCommand,
         take_screenshot: takeScreenshot,

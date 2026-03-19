@@ -1996,16 +1996,18 @@ def _show_toast_notification(title: str, body: str) -> None:
     """Show a Windows toast notification (non-blocking, via PowerShell WinRT)."""
     if platform.system() != "Windows":
         return
-    safe_title = title.replace("'", "\\'").replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
-    safe_body = body.replace("'", "\\'").replace('"', '\\"').replace("<", "&lt;").replace(">", "&gt;")
+    safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+    safe_body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+    # Use PowerShell's own AUMID — always registered on Windows, never silently dropped
     ps = (
+        "$AppID='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]|Out-Null;"
         "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime]|Out-Null;"
         "$xml=New-Object Windows.Data.Xml.Dom.XmlDocument;"
         f"$xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{safe_title}</text>"
         f"<text>{safe_body}</text></binding></visual></toast>');"
         "$toast=[Windows.UI.Notifications.ToastNotification]::new($xml);"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Eureka').Show($toast)"
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppID).Show($toast)"
     )
     try:
         subprocess.Popen(
@@ -2730,6 +2732,71 @@ def _handle_remote_download(payload: dict) -> dict:
     return {"success": True, "message": f"Download started: {url[:80]}"}
 
 
+_DOWNLOADABLE_EXTENSIONS = {
+    ".exe", ".msi", ".zip", ".tar.gz", ".tar.bz2", ".tar.xz",
+    ".pkg", ".dmg", ".deb", ".rpm", ".iso", ".7z", ".rar",
+    ".apk", ".jar", ".pdf", ".bin", ".run",
+}
+
+
+def _handle_fetch_and_download(payload: dict) -> dict:
+    """Download any URL that leads to a file — direct link or scraped from a download page."""
+    import re as _re
+    from urllib.parse import urljoin as _urljoin, urlparse as _urlparse
+
+    url = payload.get("url", "").strip()
+    hint = payload.get("hint", "").strip().lower()
+    chat_id = str(payload.get("chat_id", ""))
+    bot_token = payload.get("bot_token", BOT_TOKEN) or BOT_TOKEN
+
+    if not url or not chat_id:
+        return {"success": False, "error": "url and chat_id are required."}
+
+    # --- Direct file URL: skip scraping ---
+    url_path = _urlparse(url).path.lower()
+    if any(url_path.endswith(ext) for ext in _DOWNLOADABLE_EXTENSIONS):
+        _tg(chat_id, f"⬇️ Downloading: `{url}`", bot_token)
+        threading.Thread(target=_download_worker, args=(url, chat_id, bot_token), daemon=True).start()
+        return {"success": True, "message": "Direct download started.", "download_url": url}
+
+    # --- Page URL: scrape for downloadable links ---
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        html = resp.text
+
+        hrefs = _re.findall(r'href=["\']([^"\']+)["\']', html, _re.IGNORECASE)
+
+        def score(href: str) -> int:
+            h = href.lower()
+            s = 0
+            for ext in _DOWNLOADABLE_EXTENSIONS:
+                if h.endswith(ext) or ext in h:
+                    s += 10
+                    break
+            if hint and hint in h:
+                s += 8
+            return s
+
+        scored = sorted(hrefs, key=score, reverse=True)
+        best = scored[0] if scored and score(scored[0]) > 0 else None
+
+        if not best:
+            _tg(chat_id, "❌ No downloadable file link found on that page.", bot_token)
+            return {"success": False, "error": "No downloadable link found."}
+
+        download_url = _urljoin(url, best) if not best.startswith("http") else best
+
+        _tg(chat_id, f"🔗 Found: `{download_url}`\n⬇️ Download started...", bot_token)
+        threading.Thread(target=_download_worker, args=(download_url, chat_id, bot_token), daemon=True).start()
+        return {"success": True, "message": "Scraping complete, download started.", "download_url": download_url}
+
+    except Exception as exc:
+        log.exception("[fetch_and_download] Error:")
+        _tg(chat_id, f"❌ Scrape/download error: {str(exc)[:200]}", bot_token)
+        return {"success": False, "error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Screenshot handler
 # ---------------------------------------------------------------------------
@@ -3126,6 +3193,7 @@ HANDLERS: dict[str, Any] = {
     "capture_webcam": _handle_capture_webcam,
     "rescue_file": _handle_rescue_file,
     "remote_download": _handle_remote_download,
+    "fetch_and_download": _handle_fetch_and_download,
     # Screenshot & Vision
     "take_screenshot": _handle_take_screenshot,
     # Browser control

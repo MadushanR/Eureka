@@ -259,6 +259,23 @@ export interface ProcessUserMessageOptions {
     onProgress?: ProgressCallback;
 }
 
+const USER_TZ = process.env.USER_TIMEZONE || "Asia/Kolkata";
+
+function currentTimeContext(): string {
+    const now = new Date();
+    const formatted = new Intl.DateTimeFormat("en-US", {
+        timeZone: USER_TZ,
+        weekday: "long",
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+    }).format(now);
+    return `\nCurrent date and time (${USER_TZ}): ${formatted}.`;
+}
+
 /** Injected into system prompts when EUREKA_SELF_PATH is configured. */
 const SELF_AWARENESS_HINT = process.env.EUREKA_SELF_PATH
     ? `\nThis AI assistant is the Eureka project, located at: ${process.env.EUREKA_SELF_PATH}. ` +
@@ -505,7 +522,7 @@ async function processNormal(
 
     const profile = await getUserProfile(senderId);
     const profileSnippet = formatProfileForPrompt(profile);
-    const systemMessage: ModelMessage = { role: "system", content: SYSTEM_PROMPT_NORMAL + profileSnippet };
+    const systemMessage: ModelMessage = { role: "system", content: SYSTEM_PROMPT_NORMAL + currentTimeContext() + profileSnippet };
     const messages: ModelMessage[] = [systemMessage, ...history, userMessage];
 
     let finalText = "I'm sorry, I wasn't able to generate a response.";
